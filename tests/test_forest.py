@@ -122,6 +122,30 @@ class MergeTest(unittest.TestCase):
         self.assertIn({"kind": "derived_from", "src": "sib", "dst": "H1"},
                       [{k: r[k] for k in ("kind", "src", "dst")} for r in canonical.relations])
 
+    def test_only_controller_commits_and_agent_stays_author(self):
+        canonical = forest_with()
+        with self.assertRaises(InvalidEdit):
+            canonical.edit("admitted_support_in_scope", "attach_evidence", ["H1"], "x", ["R+"], by="agent",
+                           verdict="supports")
+        f = fork(canonical)
+        f.forest.edit("admitted_support_in_scope", "attach_evidence", ["H1"], "x", ["R+"], by="agent",
+                      verdict="supports", status="supported")
+        merge(f, canonical)
+        self.assertEqual((canonical.log[-1]["body"]["by"], canonical.log[-1]["body"]["author"]), ("controller", "agent"))
+        self.assertEqual(canonical.assessments[-1].by, "agent")
+        self.assertEqual(Forest.from_events(canonical.log).head, canonical.head)
+
+    def test_branch_budget(self):
+        canonical = Forest()
+        f = fork(canonical)
+        f.forest.add_plan(PLAN)
+        for i in range(3):
+            f.forest.edit("unexplained_observation", "propose", [f"H{i}"], "x", by="agent",
+                          hypothesis=hyp(f"H{i}", A, mechanism=f"mechanism {i}", plans=["P1"]))
+        report = merge(f, canonical, budget=2)
+        self.assertEqual(([a["id"] for a in report["admitted"]], [a["id"] for a in report["archived"]]),
+                         (["H0", "H1"], ["H2"]))
+
     def test_stale_fork_edit_is_rejected(self):
         canonical = forest_with()
         f = fork(canonical)

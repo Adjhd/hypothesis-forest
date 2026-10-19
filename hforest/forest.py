@@ -56,6 +56,7 @@ RECORD_KINDS = ("scientific", "engineering", "infrastructure")
 VERDICTS = ("supports", "contradicts", "inconclusive")
 APPLICABILITY = ("applicable", "partially_applicable", "not_applicable")
 PLAN_FIELDS = ("objective", "protocol", "intervention", "controls", "observables", "falsifiers")
+CONTROLLER = "controller"  # the only committer of a canonical forest (A6)
 PROPOSE_FIELDS = ("id", "statement", "scope", "predictions", "falsifiers", "mechanism", "variables", "endpoints", "plans")
 
 
@@ -132,7 +133,8 @@ def _jsonable(value):
 
 
 class Forest:
-    def __init__(self):
+    def __init__(self, canonical: bool = True):
+        self.canonical = canonical  # False for an agent's private fork
         self.hypotheses: dict[str, Hypothesis] = {}
         self.records: dict[str, Record] = {}
         self.plans: dict[str, dict] = {}
@@ -151,13 +153,15 @@ class Forest:
         errors = plan_errors(plan) + ([f"plan exists: {plan['id']}"] if plan.get("id") in self.plans else [])
         return self._commit("plan", _jsonable(plan), errors)
 
-    def edit(self, trigger: str, op: str, targets, reason: str, evidence=(), by: str = "controller", **params) -> str:
+    def edit(self, trigger: str, op: str, targets, reason: str, evidence=(), by: str = CONTROLLER,
+             author: str | None = None, **params) -> str:
+        """``by`` commits the edit; ``author`` proposed it (defaults to ``by``)."""
         body = {"trigger": trigger, "op": op, "targets": list(targets), "reason": reason,
-                "evidence": list(evidence), "by": by, "params": _jsonable(params)}
+                "evidence": list(evidence), "by": by, "author": author or by, "params": _jsonable(params)}
         return self._commit("edit", body, self.edit_errors(body))
 
     def copy(self) -> "Forest":
-        return Forest.from_events(self.log)
+        return Forest.from_events(self.log, self.canonical)
 
     def save(self, path) -> None:
         Path(path).write_text("".join(json.dumps(e, ensure_ascii=False, sort_keys=True) + "\n" for e in self.log))
@@ -167,9 +171,9 @@ class Forest:
         return cls.from_events(json.loads(line) for line in Path(path).read_text().splitlines() if line.strip())
 
     @classmethod
-    def from_events(cls, events) -> "Forest":
+    def from_events(cls, events, canonical: bool = True) -> "Forest":
         """Replay a log; every event is re-validated and its head re-derived."""
-        forest = cls()
+        forest = cls(canonical)
         for event in events:
             if event["parent"] != forest.head:
                 raise InvalidEdit(f"event {event['seq']} has parent {event['parent']}, expected {forest.head}")
@@ -180,7 +184,8 @@ class Forest:
                 head = forest.add_plan(event["body"])
             else:
                 b = event["body"]
-                head = forest.edit(b["trigger"], b["op"], b["targets"], b["reason"], b["evidence"], b["by"], **b["params"])
+                head = forest.edit(b["trigger"], b["op"], b["targets"], b["reason"], b["evidence"], b["by"],
+                                   b["author"], **b["params"])
             if head != event["head"]:
                 raise InvalidEdit(f"event {event['seq']} replays to {head}, log says {event['head']}")
         return forest
@@ -208,6 +213,8 @@ class Forest:
             return [f"unknown trigger: {trigger}"]
         ops, reachable, needs_admitted = RULES[trigger]
         errors = []
+        if self.canonical and body["by"] != CONTROLLER:
+            errors.append("only the controller commits to a canonical forest; agents edit a fork")
         if op not in ops:
             errors.append(f"{op} is not allowed for {trigger}; allowed: {sorted(ops)}")
         if not body["reason"].strip():
@@ -373,7 +380,7 @@ class Forest:
         elif op == "attach_evidence":
             self.assessments.append(Assessment(h.id, h.revision, tuple(b["evidence"]),
                                                Scope.from_dict(p.get("target_scope") or h.scope),
-                                               p["verdict"], p.get("applicability", "applicable"), b["by"]))
+                                               p["verdict"], p.get("applicability", "applicable"), b["author"]))
         elif op == "narrow_scope":
             h.scope, h.revision = Scope.from_dict(p["new_scope"]), h.revision + 1
         elif op == "split":

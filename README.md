@@ -79,7 +79,9 @@ Evidence whose scope only overlaps the claim needs an explicit `target_scope` or
 disjoint evidence is rejected. A condition-dependent outcome splits a hypothesis into children that partition one
 dimension of its scope.
 
-**Merge and use.** Edits from a fork are re-validated against the canonical state at merge time, so an edit made
+**Merge and use.** Agents never write the canonical forest: it accepts only edits committed by the controller,
+and `merge` commits each admitted fork edit as the controller while keeping the agent as its `author`.
+`merge(..., budget=n)` admits at most `n` new hypotheses per fork, so growth stays bounded. Edits from a fork are re-validated against the canonical state at merge time, so an edit made
 against a stale base is rejected rather than silently applied. A hypothesis becomes usable as a direct prior only
 after `paired_gate` accepts it and `authorize` sets an authorized scope inside its validity scope; `retrieve`
 returns at most one card per role first (`direct_prior`, `negative_prior`, `in_scope_unvalidated`,

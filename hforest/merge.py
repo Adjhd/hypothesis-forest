@@ -10,13 +10,15 @@ Merging replays the fork's new events onto the canonical forest at its
 * every other edit is re-validated against the current canonical state, so an
   edit that was valid on a stale head is rejected instead of being forced in.
 
+Each merge admits at most ``budget`` new hypotheses (the branch budget);
+the controller commits every admitted edit and the agent stays its author.
 Merges into one canonical forest must run one at a time.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .forest import Forest, Hypothesis, InvalidEdit, content_key, plan_errors
+from .forest import CONTROLLER, Forest, Hypothesis, InvalidEdit, content_key, plan_errors
 from .scope import DISJOINT, EQUIVALENT, Scope, relation
 
 
@@ -28,7 +30,7 @@ class Fork:
 
 
 def fork(canonical: Forest) -> Fork:
-    return Fork(canonical.copy(), canonical.head, len(canonical.log))
+    return Fork(Forest.from_events(canonical.log, canonical=False), canonical.head, len(canonical.log))
 
 
 def admission(candidate: Hypothesis, canonical: Forest, actionable: bool) -> tuple[str, str | None, str]:
@@ -62,7 +64,7 @@ def admission(candidate: Hypothesis, canonical: Forest, actionable: bool) -> tup
     return "archive", None, "new proposition without evidence or a discriminating plan"
 
 
-def merge(f: Fork, canonical: Forest) -> dict:
+def merge(f: Fork, canonical: Forest, budget: int | None = None) -> dict:
     """Replay the fork's new events onto ``canonical``; return what happened to each."""
     branch = f.forest
     if canonical.log[:f.base_len] != branch.log[:f.base_len]:
@@ -86,6 +88,8 @@ def merge(f: Fork, canonical: Forest) -> dict:
                 actionable = candidate.id in tested or any(
                     pid in branch.plans and not plan_errors(branch.plans[pid]) for pid in candidate.plans)
                 decision, existing, reason = admission(candidate, canonical, actionable)
+                if decision in ("new", "refines", "derived_from") and budget is not None and len(report["admitted"]) >= budget:
+                    decision, reason = "archive", f"branch budget of {budget} new hypotheses is spent"
                 item = {"id": candidate.id, "decision": decision, "existing": existing, "reason": reason}
                 if decision == "archive":
                     dropped.add(candidate.id)
@@ -99,7 +103,8 @@ def merge(f: Fork, canonical: Forest) -> dict:
                         params["link"] = {"kind": decision, "to": existing}
                     elif params.get("link"):
                         params["link"] = dict(params["link"], to=alias.get(params["link"]["to"], params["link"]["to"]))
-                    canonical.edit(b["trigger"], "propose", b["targets"], b["reason"], b["evidence"], b["by"], **params)
+                    canonical.edit(b["trigger"], "propose", b["targets"], b["reason"], b["evidence"], CONTROLLER,
+                                   b["author"], **params)
                     report["admitted"].append(item)
             elif any(t in dropped for t in b["targets"]):
                 report["skipped"].append({"seq": event["seq"], "op": b["op"], "targets": b["targets"]})
@@ -108,7 +113,7 @@ def merge(f: Fork, canonical: Forest) -> dict:
                 if "survivor" in params:
                     params["survivor"] = alias.get(params["survivor"], params["survivor"])
                 targets = [alias.get(t, t) for t in b["targets"]]
-                canonical.edit(b["trigger"], b["op"], targets, b["reason"], b["evidence"], b["by"], **params)
+                canonical.edit(b["trigger"], b["op"], targets, b["reason"], b["evidence"], CONTROLLER, b["author"], **params)
         except InvalidEdit as err:
             if event["kind"] == "edit" and b["op"] == "propose":
                 dropped.add(b["targets"][0])
