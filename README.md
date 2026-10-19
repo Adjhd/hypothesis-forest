@@ -2,7 +2,7 @@
 
 A minimal, dependency-free implementation of the **hypothesis forest**: a shared, append-only state for
 scientific hypotheses that agents propose, test, split, merge and transfer, and that a controller commits.
-The whole library is about 700 lines of Python, written to be read and debugged end to end.
+The whole library is about 800 lines of Python, written to be read and debugged end to end.
 
 ```
 hforest/
@@ -10,8 +10,10 @@ hforest/
   forest.py     the forest, its 14 growth rules, the append-only log and replay
   merge.py      fork a forest for an agent; admit its proposals back into the canonical forest
   priors.py     turn the forest into role-labelled prior cards for a new task
+  policy.py     choose the experiment that best separates declared rival hypotheses
   promotion.py  paired sign-test gate that authorizes a hypothesis for use
 examples/steel_demo.py   formation, evolution and merge on a toy weathering-steel forest
+examples/regime_pilot.py when discrimination, failure gating and splitting pay off (toy world)
 tests/test_forest.py     the rules as executable checks
 ```
 
@@ -74,9 +76,10 @@ fork's events onto the current canonical forest. Each proposal is resolved by co
 its later edits are redirected to the existing node) or `archive` (no new test or plan, or no identity to resolve).
 Only actionable proposals, those tested in the fork or carrying a valid plan, enter.
 
-**Evolution.** Admitted, in-scope evidence moves status (`proposed -> tested -> supported / contradicted -> scoped`).
+**Evolution.** Admitted evidence that covers the whole claim moves status (`proposed -> tested -> supported / contradicted -> scoped`).
 Evidence whose scope only overlaps the claim needs an explicit `target_scope` or a written `scope_review`;
-disjoint evidence is rejected. A condition-dependent outcome splits a hypothesis into children that partition one
+disjoint evidence is rejected; evidence on part of the scope can only make a claim
+`tested`, after which it is split or narrowed. A condition-dependent outcome splits a hypothesis into children that partition one
 dimension of its scope.
 
 **Merge and use.** Agents never write the canonical forest: it accepts only edits committed by the controller,
@@ -86,6 +89,10 @@ against a stale base is rejected rather than silently applied. A hypothesis beco
 after `paired_gate` accepts it and `authorize` sets an authorized scope inside its validity scope; `retrieve`
 returns at most one card per role first (`direct_prior`, `negative_prior`, `in_scope_unvalidated`,
 `transfer_candidate`, ...) and marks `inherits_conclusion` only for direct priors.
+
+**Deciding what to test.** `choose_experiment` scores each candidate condition by the entropy of the outcomes
+predicted by the active rivals (hypotheses linked by `competes`) whose scope covers it, and returns the best one.
+The forest changes decisions only through this structure; it is never pasted into a prompt as memory.
 
 ## Design rules for contributors
 

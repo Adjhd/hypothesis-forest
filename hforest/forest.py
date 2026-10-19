@@ -275,6 +275,8 @@ class Forest:
         if expected.get(body["trigger"], verdict) != verdict:
             errors.append(f"{body['trigger']} needs a {expected[body['trigger']]} verdict")
         target_scope = Scope.from_dict(p.get("target_scope") or h.scope)
+        if p.get("status") in ("supported", "contradicted") and not covers(target_scope, h.scope):
+            errors.append("evidence on part of the scope can only make it tested; split or narrow first")
         for eid in body["evidence"]:
             record = self.records[eid]
             if verdict == "inconclusive":

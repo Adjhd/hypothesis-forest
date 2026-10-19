@@ -1,7 +1,7 @@
 """Run with:  python -m unittest discover tests"""
 import unittest
 
-from hforest import RULES, Forest, InvalidEdit, Record, Scope, fork, merge, paired_gate, retrieve
+from hforest import RULES, Forest, InvalidEdit, Record, Scope, choose_experiment, fork, merge, paired_gate, retrieve
 from hforest.scope import COVERS, DISJOINT, EQUIVALENT, OVERLAPS, UNKNOWN, relation
 
 A = Scope({"protocol": "immersion", "Cr": {"min": 0.5, "max": 3.0}})
@@ -65,6 +65,16 @@ class GrowthRulesTest(unittest.TestCase):
             f.edit("admitted_support_in_scope", "attach_evidence", ["H1"], "x", ["T+"], verdict="supports")
         f.edit("admitted_support_in_scope", "attach_evidence", ["H1"], "x", ["T+"], verdict="supports",
                scope_review={"T+": "immersion is the deciding condition"})
+
+    def test_partial_scope_evidence_cannot_settle_the_whole_claim(self):
+        f = forest_with("H1", AB)
+        f.add_record(Record("T", "raw", A, "lab", tier="E2"))
+        f.add_record(Record("T+", "ok", A, "qc", tier="E4", admits="T"))
+        with self.assertRaises(InvalidEdit):
+            f.edit("admitted_contradiction_in_scope", "attach_evidence", ["H1"], "x", ["T+"], verdict="contradicts",
+                   target_scope=A, status="contradicted")
+        f.edit("admitted_contradiction_in_scope", "attach_evidence", ["H1"], "x", ["T+"], verdict="contradicts",
+               target_scope=A, status="tested")
 
     def test_proposition_1_failures_cannot_refute(self):
         for trigger, (ops, reachable, needs_admitted) in RULES.items():
@@ -176,6 +186,16 @@ class LogAndPriorsTest(unittest.TestCase):
         card = retrieve(f, target, variables=["Cr"])[0]
         self.assertEqual((card["role"], card["inherits_conclusion"]), ("direct_prior", True))
         self.assertEqual(retrieve(f, B, variables=["Cr"])[0]["role"], "transfer_candidate")
+
+    def test_choose_experiment_separates_rivals(self):
+        f = Forest()
+        for t in range(4):
+            f.edit("unexplained_observation", "propose", [f"T{t}"], "x", hypothesis=hyp(f"T{t}", AB, mechanism=f"t{t}"))
+        f.edit("unresolved_competition", "link_competition", ["T0", "T1", "T2", "T3"], "x", observable="high")
+        doses = {f"x{x}": Scope({"protocol": "immersion", "Cr": 1.0, "x": x}) for x in range(4)}
+        best, bits = choose_experiment(f, doses, lambda h, e: int(e[1:]) >= int(h.id[1:]))
+        self.assertEqual((best, bits), ("x1", 1.0))  # x1 splits thresholds {0,1} | {2,3}
+        self.assertEqual(choose_experiment(f, {"far": Scope({"protocol": "salt"})}, lambda h, e: 0), (None, 0.0))
 
     def test_paired_gate(self):
         self.assertAlmostEqual(paired_gate([(0, 1)] * 5)["p_value"], 1 / 32)
