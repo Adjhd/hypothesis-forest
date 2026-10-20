@@ -42,6 +42,12 @@ from hforest.policy import ACTIVE, disagreement  # noqa: E402
 
 CONDITIONS, DOSES, THRESHOLDS = ("c0", "c1", "c2"), range(6), range(7)
 RECALL, FALSE_ALARM, BUDGET = 0.9, 0.05, 18
+WINDOW, NOTE_CHARS = None, 1200  # model agents see only the last WINDOW runs (None: all) plus their own notes
+
+
+def configure(conditions=3, per_condition=6, window=None):
+    global CONDITIONS, BUDGET, WINDOW
+    CONDITIONS, BUDGET, WINDOW = tuple(f"c{i}" for i in range(conditions)), per_condition * conditions, window
 CELLS = {"easy": (0.0, 0.0), "dependent": (0.0, 1.0), "failures": (0.2, 0.0), "both": (0.2, 1.0)}
 
 
@@ -168,14 +174,16 @@ def forest_episode(seed, q, dep, replicate=True):
 
 # ------------------------------------------------------------ model agents
 SYSTEM = """You run experiments to identify a hidden rule.
-There are three conditions: c0, c1, c2. In each condition, a run at integer dose x (0..5) reads "high" if x >= t and "low" otherwise, for an unknown integer threshold t in 0..6. Conditions may share one threshold or have different thresholds; do not assume either.
+There are {k} conditions: {names}. In each condition, a run at integer dose x (0..5) reads "high" if x >= t and "low" otherwise, for an unknown integer threshold t in 0..6. Conditions may share one threshold or have different thresholds; do not assume either.
 Some runs fail. A failed run reads "low" whatever the dose. The operations log raises "ops_alarm": true on most failed runs, but misses some and occasionally alarms on a good run.
-You have at most 18 runs. Each turn, return only JSON:
-{"possible": {"c0": [...], "c1": [...], "c2": [...]}, "action": {"condition": "c1", "dose": 3}}
+You have at most {budget} runs. Each turn, return only JSON:
+{{"possible": {{"c0": [...], ...one list per condition...}}, "action": {{"condition": "c1", "dose": 3}}, "notes": "..."}}
 "possible" lists every threshold you still consider possible in each condition. Use "action": "stop" when you are done or no runs are left.
-You succeed if, when you stop, each condition's list contains exactly its true threshold."""
+You succeed if, when you stop, each condition's list contains exactly its true threshold.{memory}"""
+MEMORY = """
+You see only the {window} most recent runs. "notes" is your own memory: whatever you write is returned to you next turn, cut to {chars} characters. Keep there what you will need from earlier runs."""
 ASSIST = """
-You also receive "forest": the state kept by a hypothesis forest. "surviving_thresholds" are the thresholds consistent with every run without an ops alarm in that condition; "recorded_but_not_refuting" lists alarmed runs, which were kept but not used to eliminate; "suggested_next" is the run that best separates the surviving thresholds (null when nothing separates them). You may use or ignore it."""
+You also receive "forest": the state kept by a hypothesis forest over all runs so far. "admitted_thresholds" are consistent with every admitted run in that condition (an unalarmed high reading is admitted at once; a low reading, which a failure could also produce, only once the same run is replicated). "provisional_thresholds" also apply the low readings awaiting replication, listed in "low_readings_awaiting_replication". "recorded_but_not_refuting" lists alarmed runs, kept but never used to eliminate. "suggested_next" is the run that best separates the provisional thresholds, or the replication a conclusion rests on (null when nothing separates them). You may use or ignore it."""
 
 
 def parse(out):
@@ -209,18 +217,24 @@ def score(runs, possible, action):
 
 
 def model_episode(call, seed, q, dep, assisted):
-    truth, runs, steps = make_world(seed, dep), [], []
+    truth, runs, steps, notes = make_world(seed, dep), [], [], ""
     state = ThresholdForest() if assisted else None
-    system = SYSTEM + (ASSIST if assisted else "")
+    memory = MEMORY.format(window=WINDOW, chars=NOTE_CHARS) if WINDOW else ""
+    system = SYSTEM.format(k=len(CONDITIONS), names=", ".join(CONDITIONS), budget=BUDGET, memory=memory)
+    system += ASSIST if assisted else ""
     possible = {c: list(THRESHOLDS) for c in CONDITIONS}
     while True:
         payload = {"runs": runs, "runs_left": BUDGET - len(runs)}
+        if WINDOW:
+            payload = {"recent_runs": runs[-WINDOW:], "earlier_runs_not_shown": max(0, len(runs) - WINDOW),
+                       "notes": notes, "runs_left": BUDGET - len(runs)}
         if assisted:
             payload["forest"] = state.view(runs)
         decision, error = None, None
         for _ in range(2):
             try:
-                decision = parse(call(system, payload if error is None else dict(payload, last_error=error)))
+                out = call(system, payload if error is None else dict(payload, last_error=error))
+                decision = parse(out)
             except Exception as exc:  # transport or JSON failure: one retry, then the episode stops
                 error = f"{type(exc).__name__}: {exc}"[:200]
                 continue
@@ -231,7 +245,9 @@ def model_episode(call, seed, q, dep, assisted):
             return {"arm": "assisted" if assisted else "flat", "seed": seed, "truth": truth, "runs": len(runs),
                     "final": possible, "solved": False, "invalid": error, "steps": steps}
         possible, action = decision
-        steps.append({"runs": len(runs), "possible": possible, "action": action, "errors": score(runs, possible, action)})
+        notes = str(out.get("notes") or "")[:NOTE_CHARS]
+        steps.append({"runs": len(runs), "possible": possible, "action": action, "notes_chars": len(notes),
+                      "errors": score(runs, possible, action)})
         if action == "stop" or len(runs) >= BUDGET:
             break
         runs.append(run_once(truth, action["condition"], action["dose"], q, seed, len(runs) + 1))
@@ -275,16 +291,21 @@ def summarize(episodes):
 def main(call=None, argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--worlds", type=int, default=200)
+    ap.add_argument("--seed0", type=int, default=0, help="first world seed")
+    ap.add_argument("--conditions", type=int, default=3)
+    ap.add_argument("--per-condition", type=int, default=6, help="run budget per condition")
+    ap.add_argument("--window", type=int, default=0, help="model agents see only this many recent runs (0: all)")
     ap.add_argument("--arms", default="forest,forest_trusting", help="comma list of forest, forest_trusting, flat, assisted")
     ap.add_argument("--cells", default=",".join(CELLS))
     ap.add_argument("--out", default="", help="episodes JSONL; finished (cell, seed, arm) are skipped on rerun")
     ap.add_argument("--jobs", type=int, default=1, help="model episodes run in parallel")
     args = ap.parse_args(argv)
+    configure(args.conditions, args.per_condition, args.window or None)
     episodes, lock = [], threading.Lock()
     if args.out and Path(args.out).exists():
         episodes = [json.loads(line) for line in Path(args.out).read_text().splitlines() if line.strip()]
     done = {(e["cell"], e["seed"], e["arm"]) for e in episodes}
-    todo = [(cell, seed, arm) for cell in args.cells.split(",") for seed in range(args.worlds)
+    todo = [(cell, seed, arm) for cell in args.cells.split(",") for seed in range(args.seed0, args.seed0 + args.worlds)
             for arm in args.arms.split(",") if (cell, seed, arm) not in done]
 
     def one(job):
