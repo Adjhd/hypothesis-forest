@@ -14,6 +14,7 @@ hforest/
   promotion.py  paired sign-test gate that authorizes a hypothesis for use
 examples/steel_demo.py   formation, evolution and merge on a toy weathering-steel forest
 examples/regime_pilot.py when discrimination, failure gating and splitting pay off (toy world)
+experiments/threshold_world.py  controlled discovery task: kernel agent vs model agents, error scoring
 tests/test_forest.py     the rules as executable checks
 ```
 
