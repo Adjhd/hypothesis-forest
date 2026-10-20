@@ -86,6 +86,10 @@ canonical.add_plan({"id": "P-salt-spray", "objective": "bridge to salt spray", "
                     "falsifiers": ["no Cr effect"]})
 canonical.edit("cross_scope_request", "propose_transfer", ["H-Cr/immersion"], "reuse in salt spray", kind="mechanism",
                target_scope=Scope({"steel": "low_alloy", "protocol": "salt_spray"}), bridge_plan="P-salt-spray",
+               shared_mechanism="Cr-enriched inner rust layer", shared_conditions="low-alloy steel, chloride attack",
+               risks="continuous spray removes the wet/dry cycling that builds the layer",
+               differences={"protocol": "weekly immersion -> continuous salt spray",
+                            "Cr_wt": "target range not yet fixed; bridge tests 1.0 and 3.0"},
                no_automatic_inheritance=True)
 h = canonical.hypotheses["H-Cr/immersion"]
 print("relation:", canonical.relations[-1]["kind"], "| status:", h.status, "| authorized:", h.authorized_scope.dims)

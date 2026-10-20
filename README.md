@@ -66,7 +66,8 @@ Two consequences follow directly from the table and are checked in the tests:
 
 1. **No refutation by failure.** Only triggers that require admitted evidence can reach `contradicted` or `scoped`,
    so a failed or blocked experiment is recorded but never weakens a hypothesis.
-2. **No inheritance by transfer.** `propose_transfer` adds a candidate relation with a bridge plan; it changes neither
+2. **No inheritance by transfer.** `propose_transfer` adds a candidate relation with a bridge plan, the shared mechanism
+   and conditions, risks, and the stated impact of every condition that differs; it changes neither
    the status nor the authorized scope of anything.
 
 ## Three processes
@@ -78,7 +79,8 @@ its later edits are redirected to the existing node) or `archive` (no new test o
 Only actionable proposals, those tested in the fork or carrying a valid plan, enter.
 
 **Evolution.** Admitted evidence that covers the whole claim moves status (`proposed -> tested -> supported / contradicted -> scoped`).
-Evidence whose scope only overlaps the claim needs an explicit `target_scope` or a written `scope_review`;
+Evidence whose scope only overlaps the claim needs an explicit `target_scope` or a `scope_review` naming a reviewer
+and a rationale;
 disjoint evidence is rejected; evidence on part of the scope can only make a claim
 `tested`, after which it is split or narrowed. A condition-dependent outcome splits a hypothesis into children that partition one
 dimension of its scope.

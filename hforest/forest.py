@@ -13,7 +13,7 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .scope import DISJOINT, OVERLAPS, UNKNOWN, Scope, covers, relation
+from .scope import DISJOINT, OVERLAPS, UNKNOWN, Scope, bridge_dims, covers, relation
 
 # Lifecycle: which status may follow which.
 TRANSITIONS = {
@@ -120,6 +120,10 @@ def plan_errors(plan: dict) -> list[str]:
     if plan.get("status", "planned") != "planned":
         errors.append("a plan is a declared design, its status stays planned")
     return errors
+
+
+def _filled(mapping, keys) -> bool:
+    return isinstance(mapping, dict) and all(isinstance(mapping.get(k), str) and mapping[k].strip() for k in keys)
 
 
 def _jsonable(value):
@@ -286,8 +290,8 @@ class Forest:
             rel, _ = relation(record.scope, target_scope)
             if rel == DISJOINT:
                 errors.append(f"{eid}: evidence scope is disjoint from the assessed scope")
-            elif rel in (OVERLAPS, UNKNOWN) and not p.get("scope_review", {}).get(eid):
-                errors.append(f"{eid}: evidence scope {rel}; needs an explicit scope_review")
+            elif rel in (OVERLAPS, UNKNOWN) and not _filled(p.get("scope_review", {}).get(eid), ("reviewer", "rationale")):
+                errors.append(f"{eid}: evidence scope {rel}; needs a scope_review with reviewer and rationale")
         return errors
 
     def _check_narrow_scope(self, targets, p, body):
@@ -316,8 +320,14 @@ class Forest:
 
     def _check_propose_transfer(self, targets, p, body):
         h, errors = self.hypotheses[targets[0]], []
-        if Scope.from_dict(p.get("target_scope", {})) == h.scope:
+        target = Scope.from_dict(p.get("target_scope", {}))
+        if target == h.scope:
             errors.append("a transfer needs a different target scope")
+        errors += [f"a transfer needs {k}" for k in ("shared_mechanism", "shared_conditions", "risks") if not p.get(k)]
+        axes = sorted({a for a in bridge_dims(relation(h.scope, target)[1]) + bridge_dims(relation(target, h.scope)[1])
+                       if not a.startswith("<")})
+        if not _filled(p.get("differences") or {}, axes):
+            errors.append(f"a transfer must state the impact of every changed condition: {axes}")
         if p.get("kind") not in ("mechanism", "method", "property"):
             errors.append("transfer kind is mechanism, method or property")
         if p.get("bridge_plan") not in self.plans:

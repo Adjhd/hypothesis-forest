@@ -64,7 +64,7 @@ class GrowthRulesTest(unittest.TestCase):
         with self.assertRaises(InvalidEdit):  # partial overlap, no review
             f.edit("admitted_support_in_scope", "attach_evidence", ["H1"], "x", ["T+"], verdict="supports")
         f.edit("admitted_support_in_scope", "attach_evidence", ["H1"], "x", ["T+"], verdict="supports",
-               scope_review={"T+": "immersion is the deciding condition"})
+               scope_review={"T+": {"reviewer": "qc", "rationale": "immersion is the deciding condition"}})
 
     def test_partial_scope_evidence_cannot_settle_the_whole_claim(self):
         f = forest_with("H1", AB)
@@ -91,13 +91,17 @@ class GrowthRulesTest(unittest.TestCase):
         f = forest_with()
         f.add_plan(PLAN)
         before = (f.hypotheses["H1"].status, f.hypotheses["H1"].authorized_scope)
-        f.edit("cross_scope_request", "propose_transfer", ["H1"], "reuse", kind="mechanism", target_scope=B,
-               bridge_plan="P1", no_automatic_inheritance=True)
+        bridge = dict(kind="mechanism", target_scope=B, bridge_plan="P1", shared_mechanism="rust layer",
+                      shared_conditions="same Cr range", risks="chloride cycling differs",
+                      differences={"protocol": "immersion -> marine air changes wet/dry cycling"})
+        with self.assertRaises(InvalidEdit):  # every changed condition needs a stated impact
+            f.edit("cross_scope_request", "propose_transfer", ["H1"], "reuse", no_automatic_inheritance=True,
+                   **dict(bridge, differences={}))
+        f.edit("cross_scope_request", "propose_transfer", ["H1"], "reuse", no_automatic_inheritance=True, **bridge)
         self.assertEqual((f.hypotheses["H1"].status, f.hypotheses["H1"].authorized_scope), before)
         self.assertEqual((f.relations[-1]["kind"], f.relations[-1]["transfer_kind"]), ("transfer_candidate", "mechanism"))
         with self.assertRaises(InvalidEdit):
-            f.edit("cross_scope_request", "propose_transfer", ["H1"], "reuse", kind="mechanism", target_scope=B,
-                   bridge_plan="P1", no_automatic_inheritance=False)
+            f.edit("cross_scope_request", "propose_transfer", ["H1"], "reuse", no_automatic_inheritance=False, **bridge)
 
     def test_propose_cannot_set_state(self):
         with self.assertRaises(InvalidEdit):
