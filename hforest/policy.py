@@ -40,17 +40,19 @@ def disagreement(outcomes) -> float:
     return -sum(c / n * math.log2(c / n) for c in counts.values()) if n else 0.0
 
 
-def choose_experiment(forest, experiments: dict, predict, cost=None) -> tuple:
+def choose_experiment(forest, experiments: dict, predict, cost=None, consider=None) -> tuple:
     """Return (experiment id, bits per unit cost) that best separates rivals, or (None, 0.0).
 
     ``experiments`` maps ids to condition Scopes; ``predict(hypothesis, experiment_id)``
     returns that hypothesis's predicted outcome. Rivals whose scope does not cover
-    the condition make no prediction there.
+    the condition make no prediction there. ``consider(hypothesis, experiment_id)`` can
+    further drop rivals the caller already doubts, e.g. on unreplicated readings.
     """
     groups, best, best_score = rival_groups(forest), None, 0.0
     for eid, condition in experiments.items():
         bits = sum(disagreement([predict(forest.hypotheses[i], eid) for i in g
-                                 if covers(forest.hypotheses[i].scope, condition)]) for g in groups)
+                                 if covers(forest.hypotheses[i].scope, condition)
+                                 and (consider is None or consider(forest.hypotheses[i], eid))]) for g in groups)
         score = bits / (cost(eid) if cost else 1.0)
         if score > best_score:
             best, best_score = eid, score

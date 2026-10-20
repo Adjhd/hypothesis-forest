@@ -8,8 +8,11 @@ ops alarm catches failures with recall 0.9 and fires on 5% of good runs.
 Agents:
   forest    the kernel alone. The seven thresholds are competing hypotheses over all
             conditions; an admitted run that contradicts one narrows its scope away from
-            that condition; alarmed runs are recorded but cannot refute; the next run is
-            the one that best separates the surviving rivals. No language model.
+            that condition; alarmed runs are recorded but cannot refute. A "high" reading
+            is admitted at once; a "low" one, which a silent failure could also produce, is
+            admitted only when the same run is replicated. The next run best separates the
+            rivals left by admitted and pending readings; when only one is left, the policy
+            replicates the low reading that conclusion rests on. No language model.
   flat      a language model reading the full run history.
   assisted  the same model, also shown the forest's state and suggestion.
 
@@ -67,7 +70,8 @@ def allowed(runs, c, with_alarmed=False):
 class ThresholdForest:
     """The kernel as the agent's state: one hypothesis per threshold, scoped by condition."""
 
-    def __init__(self):
+    def __init__(self, replicate=True):
+        self.replicate = replicate  # False: trust every unalarmed reading at once
         f = self.forest = Forest()
         f.add_plan({"id": "P-dose", "objective": "locate the threshold", "protocol": "one run at a condition and dose",
                     "intervention": "dose 0..5", "controls": ["dose 0", "dose 5"], "observables": ["reading"],
@@ -81,14 +85,29 @@ class ThresholdForest:
         f.edit("unresolved_competition", "link_competition", [f"t{t}" for t in THRESHOLDS], "rival thresholds",
                observable="reading")
 
+        self.pending, self.admitted = {}, []  # (condition, dose) -> unreplicated low runs; admitted runs
+
     def observe(self, run):
-        f, c, rid = self.forest, run["condition"], f"run{run['run']}"
-        here = Scope({"condition": c})
-        f.add_record(Record(rid, json.dumps(run), here, "threshold-world", tier="E3",
+        f, c, x, rid = self.forest, run["condition"], run["dose"], f"run{run['run']}"
+        f.add_record(Record(rid, json.dumps(run), Scope({"condition": c}), "threshold-world", tier="E3",
                             kind="infrastructure" if run["ops_alarm"] else "scientific"))
         if run["ops_alarm"]:
             return
-        f.add_record(Record(rid + "+", "no ops alarm", here, "ops-log", tier="E4", admits=rid))
+        if run["reading"] == "high" or not self.replicate:
+            self._admit(run, "no ops alarm" if not self.replicate else "no ops alarm; a failure cannot read high")
+            for (k, d) in [key for key in self.pending if key[0] == c and key[1] >= x]:
+                self.pending.pop((k, d))  # a low at or above an admitted high was a silent failure
+        elif (c, x) in self.pending and min(self.alive(c), default=x + 1) <= x:
+            for earlier in self.pending.pop((c, x)) + [run]:
+                self._admit(earlier, f"low reading replicated at {c}, dose {x}")
+        elif min(self.alive(c), default=x + 1) <= x:  # informative: it would rule out thresholds <= x
+            self.pending.setdefault((c, x), []).append(run)
+
+    def _admit(self, run, reason):
+        f, c, rid = self.forest, run["condition"], f"run{run['run']}"
+        here = Scope({"condition": c})
+        f.add_record(Record(rid + "+", reason, here, "ops-log", tier="E4", admits=rid))
+        self.admitted.append(run)
         for h in list(f.hypotheses.values()):
             t, conds = int(h.id[1:]), h.scope.dims["condition"]
             if h.status not in ACTIVE or c not in conds or (run["dose"] >= t) == (run["reading"] == "high"):
@@ -107,29 +126,43 @@ class ThresholdForest:
         return {int(h.id[1:]) for h in self.forest.hypotheses.values()
                 if h.status in ACTIVE and c in h.scope.dims["condition"]}
 
+    def provisional(self, c):
+        lows = [x for (k, x) in self.pending if k == c]
+        return {t for t in self.alive(c) if all(x < t for x in lows)}
+
+    def final(self, c):
+        return self.alive(c) if len(self.alive(c)) == 1 else self.provisional(c)
+
     def suggest(self):
+        for c in CONDITIONS:
+            left = self.provisional(c)
+            if len(left) == 1 and len(self.alive(c)) > 1:
+                return {"condition": c, "dose": min(left) - 1}, 0.0  # replicate the deciding low reading
         options = {f"{c}:{x}": Scope({"condition": c, "dose": x}) for c in CONDITIONS for x in DOSES}
-        eid, bits = choose_experiment(self.forest, options, lambda h, e: int(e.split(":")[1]) >= int(h.id[1:]))
+        eid, bits = choose_experiment(self.forest, options, lambda h, e: int(e.split(":")[1]) >= int(h.id[1:]),
+                                      consider=lambda h, e: int(h.id[1:]) in self.provisional(e.split(":")[0]))
         return (None, 0.0) if eid is None else ({"condition": eid.split(":")[0], "dose": int(eid.split(":")[1])}, bits)
 
     def view(self, runs):
         nxt, bits = self.suggest()
-        return {"surviving_thresholds": {c: sorted(self.alive(c)) for c in CONDITIONS},
+        return {"admitted_thresholds": {c: sorted(self.alive(c)) for c in CONDITIONS},
+                "provisional_thresholds": {c: sorted(self.provisional(c)) for c in CONDITIONS},
+                "low_readings_awaiting_replication": sorted(r["run"] for runs_ in self.pending.values() for r in runs_),
                 "recorded_but_not_refuting": [r["run"] for r in runs if r["ops_alarm"]],
                 "suggested_next": nxt and dict(nxt, bits=round(bits, 3))}
 
 
-def forest_episode(seed, q, dep):
-    truth, state, runs = make_world(seed, dep), ThresholdForest(), []
+def forest_episode(seed, q, dep, replicate=True):
+    truth, state, runs = make_world(seed, dep), ThresholdForest(replicate), []
     while len(runs) < BUDGET and not all(len(state.alive(c)) == 1 for c in CONDITIONS):
         nxt, _ = state.suggest()
         if nxt is None:
             break
         runs.append(run_once(truth, nxt["condition"], nxt["dose"], q, seed, len(runs) + 1))
         state.observe(runs[-1])
-        assert all(state.alive(c) == allowed(runs, c) for c in CONDITIONS), "kernel state != admitted evidence"
-    final = {c: sorted(state.alive(c)) for c in CONDITIONS}
-    return {"arm": "forest", "seed": seed, "truth": truth, "runs": len(runs), "final": final,
+        assert all(state.alive(c) == allowed(state.admitted, c) for c in CONDITIONS), "kernel != admitted evidence"
+    final = {c: sorted(state.final(c)) for c in CONDITIONS}
+    return {"arm": "forest" if replicate else "forest_trusting", "seed": seed, "truth": truth, "runs": len(runs), "final": final,
             "solved": all(final[c] == [truth[c]] for c in CONDITIONS), "steps": []}
 
 
@@ -225,7 +258,7 @@ def summarize(episodes):
     rows = {}
     for e in episodes:
         rows.setdefault((e["cell"], e["arm"]), []).append(e)
-    print(f"{'cell':10} {'arm':9} {'n':>3} {'solved':>7} {'runs':>5} {'nondisc':>8} {'fail=ref':>8} "
+    print(f"{'cell':10} {'arm':15} {'n':>3} {'solved':>7} {'runs':>5} {'nondisc':>8} {'fail=ref':>8} "
           f"{'overgen':>8} {'unsupp':>7} {'invalid':>7}")
     for (cell, arm), es in sorted(rows.items()):
         steps = [s for e in es for s in e["steps"]]
@@ -233,7 +266,7 @@ def summarize(episodes):
 
         def rate(key, pool):
             return f"{sum(s['errors'][key] for s in pool) / len(pool):.0%}" if pool else "-"
-        print(f"{cell:10} {arm:9} {len(es):>3} {sum(e['solved'] for e in es) / len(es):>7.0%} "
+        print(f"{cell:10} {arm:15} {len(es):>3} {sum(e['solved'] for e in es) / len(es):>7.0%} "
               f"{sum(e['runs'] for e in es) / len(es):>5.1f} {rate('non_discriminating', acts):>8} "
               f"{rate('failure_as_refutation', steps):>8} {rate('overgeneralization', steps):>8} "
               f"{rate('unsupported_exclusion', steps):>7} {sum(bool(e.get('invalid')) for e in es):>7}")
@@ -242,7 +275,7 @@ def summarize(episodes):
 def main(call=None, argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--worlds", type=int, default=200)
-    ap.add_argument("--arms", default="forest", help="comma list of forest, flat, assisted")
+    ap.add_argument("--arms", default="forest,forest_trusting", help="comma list of forest, forest_trusting, flat, assisted")
     ap.add_argument("--cells", default=",".join(CELLS))
     ap.add_argument("--out", default="", help="episodes JSONL; finished (cell, seed, arm) are skipped on rerun")
     ap.add_argument("--jobs", type=int, default=1, help="model episodes run in parallel")
@@ -257,7 +290,8 @@ def main(call=None, argv=None):
     def one(job):
         cell, seed, arm = job
         q, dep = CELLS[cell]
-        e = forest_episode(seed, q, dep) if arm == "forest" else model_episode(call, seed, q, dep, arm == "assisted")
+        e = (forest_episode(seed, q, dep, arm == "forest") if arm.startswith("forest")
+             else model_episode(call, seed, q, dep, arm == "assisted"))
         e["cell"] = cell
         with lock:
             episodes.append(e)
