@@ -16,17 +16,18 @@ ROLES = ("direct_prior", "negative_prior", "open_discrimination", "transfer_cand
 _OPEN = ("proposed", "tested", "revised", "reactivated")
 
 
-def classify(h: Hypothesis, forest: Forest, target: Scope, keys: set, domain_dims=()) -> dict | None:
+def classify(h: Hypothesis, forest: Forest, target: Scope, keys: tuple, domain_dims=()) -> dict | None:
+    """``keys`` is the query's content key (mechanism, variables, endpoints), matched field by field."""
     if h.status == "retired" or h.merged_into:
         return None
-    mechanism, variables, endpoints = content_key(h)
-    hits = keys & ({mechanism} | set(variables) | set(endpoints))
-    if keys and not hits:
+    (qm, qv, qe), (hm, hv, he) = keys, content_key(h)
+    hits = len(set(qv) & set(hv)) + len(set(qe) & set(he)) + int(bool(qm) and qm == hm)
+    if any((qm, qv, qe)) and not hits:
         return None
     rel, per = relation(h.scope, target)
     competing = any(r["kind"] == "competes" and h.id in (r["src"], r["dst"]) for r in forest.relations)
     if rel == DISJOINT:
-        if not keys:
+        if not any((qm, qv, qe)):
             return None
         crossed = {d for d, r in per.items() if r == DISJOINT} & set(domain_dims)
         role = "cross_domain_transfer" if crossed else "transfer_candidate"
@@ -45,7 +46,7 @@ def classify(h: Hypothesis, forest: Forest, target: Scope, keys: set, domain_dim
         role = "transfer_candidate"
     admitted = [a for a in forest.assessments if a.hypothesis == h.id
                 and any(forest.records[e].admitted for e in a.evidence)]
-    score = len(hits) + 2 * sum(a.verdict == "supports" for a in admitted) + sum(a.verdict == "contradicts" for a in admitted)
+    score = hits + 2 * sum(a.verdict == "supports" for a in admitted) + sum(a.verdict == "contradicts" for a in admitted)
     return {"id": h.id, "role": role, "status": h.status, "relation": rel, "statement": h.statement,
             "bridge": [] if role == "direct_prior" else bridge_dims(per),
             "inherits_conclusion": role == "direct_prior", "score": score}
@@ -55,8 +56,7 @@ def retrieve(forest: Forest, target: Scope, *, variables=(), endpoints=(), mecha
              domain_dims=(), max_cards: int = 12) -> list[dict]:
     """A bounded, role-diverse prior pack: first the best card of each role, then by score."""
     probe = Hypothesis("query", "query", target, ["-"], ["-"], mechanism, list(variables), list(endpoints))
-    m, v, e = content_key(probe)
-    keys = ({m} if m else set()) | set(v) | set(e)
+    keys = content_key(probe)
     cards = [c for h in forest.hypotheses.values() if (c := classify(h, forest, target, keys, domain_dims))]
     cards.sort(key=lambda c: (ROLES.index(c["role"]), -c["score"], c["id"]))
     first = [next(c for c in cards if c["role"] == role) for role in ROLES if any(c["role"] == role for c in cards)]
