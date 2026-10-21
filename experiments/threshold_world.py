@@ -13,6 +13,10 @@ Agents:
             admitted only when the same run is replicated. The next run best separates the
             rivals left by admitted and pending readings; when only one is left, the policy
             replicates the low reading that conclusion rests on. No language model.
+  forest_adaptive  the kernel with the failure rate estimated from all runs so far: a low reading
+            is admitted once the chance it is a silent failure is at most ADMIT_RISK, and the
+            next run carries the most information under that failure model, so a replication
+            is chosen only when it is worth more than a new dose.
   flat      a language model reading the full run history.
   assisted  the same model, also shown the forest's state and suggestion.
 
@@ -28,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import random
 import sys
@@ -41,7 +46,7 @@ from hforest import Forest, Record, Scope, choose_experiment  # noqa: E402
 from hforest.policy import ACTIVE, disagreement  # noqa: E402
 
 CONDITIONS, DOSES, THRESHOLDS = ("c0", "c1", "c2"), range(6), range(7)
-RECALL, FALSE_ALARM, BUDGET = 0.9, 0.05, 18
+RECALL, FALSE_ALARM, BUDGET, ADMIT_RISK = 0.9, 0.05, 18, 0.01
 WINDOW, NOTE_CHARS = None, 1200  # model agents see only the last WINDOW runs (None: all) plus their own notes
 
 
@@ -72,12 +77,34 @@ def allowed(runs, c, with_alarmed=False):
                                          if r["condition"] == c and (with_alarmed or not r["ops_alarm"]))}
 
 
+def likelihood(t, run, q):
+    """P(reading, alarm | threshold t) when a run fails with probability q."""
+    good = (1 - q) * (FALSE_ALARM if run["ops_alarm"] else 1 - FALSE_ALARM)
+    bad = q * (RECALL if run["ops_alarm"] else 1 - RECALL)
+    return good * ((run["dose"] >= t) == (run["reading"] == "high")) + bad * (run["reading"] == "low")
+
+
+def failure_rate(runs):
+    """Posterior mean failure rate given every run, flat prior on 0..0.5 and on each threshold."""
+    grid, like = [i / 100 for i in range(51)], []
+    for q in grid:
+        p = 1.0
+        for c in {r["condition"] for r in runs}:
+            mine = [r for r in runs if r["condition"] == c]
+            p *= sum(math.prod(likelihood(t, r, q) for r in mine) for t in THRESHOLDS) / len(THRESHOLDS)
+        like.append(p)
+    return sum(q * w for q, w in zip(grid, like)) / sum(like)
+
+
 # ----------------------------------------------------------- kernel agent
 class ThresholdForest:
     """The kernel as the agent's state: one hypothesis per threshold, scoped by condition."""
 
-    def __init__(self, replicate=True):
-        self.replicate = replicate  # False: trust every unalarmed reading at once
+    def __init__(self, policy="replicate"):
+        # replicate: a low reading waits for one replication; trust: every unalarmed reading counts at once;
+        # adaptive: a low reading is admitted once the chance it is a silent failure is at most ADMIT_RISK,
+        # under the failure rate estimated so far, and runs are chosen by information under that model
+        self.policy, self.replicate, self.runs, self._q = policy, policy != "trust", [], (-1, 0.0)
         f = self.forest = Forest()
         f.add_plan({"id": "P-dose", "objective": "locate the threshold", "protocol": "one run at a condition and dose",
                     "intervention": "dose 0..5", "controls": ["dose 0", "dose 5"], "observables": ["reading"],
@@ -97,7 +124,17 @@ class ThresholdForest:
         f, c, x, rid = self.forest, run["condition"], run["dose"], f"run{run['run']}"
         f.add_record(Record(rid, json.dumps(run), Scope({"condition": c}), "threshold-world", tier="E3",
                             kind="infrastructure" if run["ops_alarm"] else "scientific"))
+        self.runs.append(run)
         if run["ops_alarm"]:
+            return
+        if self.policy == "adaptive":
+            if run["reading"] == "high":
+                self._admit(run, "no ops alarm; a failure cannot read high")
+                for key in [key for key in self.pending if key[0] == c and key[1] >= x]:
+                    self.pending.pop(key)
+            else:
+                self.pending.setdefault((c, x), []).append(run)
+            self._admit_safe_lows()
             return
         if run["reading"] == "high" or not self.replicate:
             self._admit(run, "no ops alarm" if not self.replicate else "no ops alarm; a failure cannot read high")
@@ -108,6 +145,38 @@ class ThresholdForest:
                 self._admit(earlier, f"low reading replicated at {c}, dose {x}")
         elif min(self.alive(c), default=x + 1) <= x:  # informative: it would rule out thresholds <= x
             self.pending.setdefault((c, x), []).append(run)
+
+    def _admit_safe_lows(self):
+        q = self.q()
+        silent, good = q * (1 - RECALL), (1 - q) * (1 - FALSE_ALARM)
+        changed = True
+        while changed:
+            changed = False
+            for (c, x), lows in list(self.pending.items()):
+                alive = self.alive(c)
+                if not alive or min(alive) > x:  # it no longer rules anything out
+                    self.pending.pop((c, x))
+                    continue
+                n, p_low = len(lows), sum(t > x for t in alive) / len(alive)
+                risk = silent ** n / (silent ** n + good ** n * p_low)
+                if risk <= ADMIT_RISK:
+                    for run in self.pending.pop((c, x)):
+                        self._admit(run, f"{n} low reading(s) at {c}, dose {x}; silent-failure risk {risk:.4f}")
+                    changed = True
+
+    def q(self):
+        if self._q[0] != len(self.runs):
+            self._q = (len(self.runs), failure_rate(self.runs))
+        return self._q[1]
+
+    def credence(self, c):
+        """Weights of the admitted thresholds in condition c given every recorded run there."""
+        q = self.q()
+        w = {t: 1.0 for t in self.alive(c)}
+        for r in self.runs:
+            if r["condition"] == c:
+                w = {t: v * likelihood(t, r, q) for t, v in w.items()}
+        return w
 
     def _admit(self, run, reason):
         f, c, rid = self.forest, run["condition"], f"run{run['run']}"
@@ -137,9 +206,24 @@ class ThresholdForest:
         return {t for t in self.alive(c) if all(x < t for x in lows)}
 
     def final(self, c):
-        return self.alive(c) if len(self.alive(c)) == 1 else self.provisional(c)
+        if len(self.alive(c)) == 1 or self.policy != "adaptive":
+            return self.alive(c) if len(self.alive(c)) == 1 else self.provisional(c)
+        w = self.credence(c)
+        return {max(w, key=w.get)} if w else set()
 
     def suggest(self):
+        if self.policy == "adaptive":
+            q, options = self.q(), {f"{c}:{x}": Scope({"condition": c, "dose": x})
+                                                   for c in CONDITIONS for x in DOSES}
+            weights = {c: self.credence(c) for c in CONDITIONS}
+
+            def predict(h, e):
+                x = int(e.split(":")[1])
+                return {(r, a): likelihood(int(h.id[1:]), {"dose": x, "reading": r, "ops_alarm": a}, q)
+                        for r in ("high", "low") for a in (False, True)}
+            eid, bits = choose_experiment(self.forest, options, predict,
+                                          weight=lambda h, e: weights[e.split(":")[0]].get(int(h.id[1:]), 0.0))
+            return (None, 0.0) if eid is None else ({"condition": eid.split(":")[0], "dose": int(eid.split(":")[1])}, bits)
         for c in CONDITIONS:
             left = self.provisional(c)
             if len(left) == 1 and len(self.alive(c)) > 1:
@@ -158,8 +242,11 @@ class ThresholdForest:
                 "suggested_next": nxt and dict(nxt, bits=round(bits, 3))}
 
 
-def forest_episode(seed, q, dep, replicate=True):
-    truth, state, runs = make_world(seed, dep), ThresholdForest(replicate), []
+KERNEL_ARMS = {"forest": "replicate", "forest_trusting": "trust", "forest_adaptive": "adaptive"}
+
+
+def forest_episode(seed, q, dep, policy="replicate"):
+    truth, state, runs = make_world(seed, dep), ThresholdForest(policy), []
     while len(runs) < BUDGET and not all(len(state.alive(c)) == 1 for c in CONDITIONS):
         nxt, _ = state.suggest()
         if nxt is None:
@@ -168,7 +255,7 @@ def forest_episode(seed, q, dep, replicate=True):
         state.observe(runs[-1])
         assert all(state.alive(c) == allowed(state.admitted, c) for c in CONDITIONS), "kernel != admitted evidence"
     final = {c: sorted(state.final(c)) for c in CONDITIONS}
-    return {"arm": "forest" if replicate else "forest_trusting", "seed": seed, "truth": truth, "runs": len(runs), "final": final,
+    return {"arm": {v: k for k, v in KERNEL_ARMS.items()}[policy], "seed": seed, "truth": truth, "runs": len(runs), "final": final,
             "solved": all(final[c] == [truth[c]] for c in CONDITIONS), "steps": []}
 
 
@@ -295,7 +382,7 @@ def main(call=None, argv=None):
     ap.add_argument("--conditions", type=int, default=3)
     ap.add_argument("--per-condition", type=int, default=6, help="run budget per condition")
     ap.add_argument("--window", type=int, default=0, help="model agents see only this many recent runs (0: all)")
-    ap.add_argument("--arms", default="forest,forest_trusting", help="comma list of forest, forest_trusting, flat, assisted")
+    ap.add_argument("--arms", default="forest,forest_trusting", help="comma list of forest, forest_trusting, forest_adaptive, flat, assisted")
     ap.add_argument("--cells", default=",".join(CELLS))
     ap.add_argument("--out", default="", help="episodes JSONL; finished (cell, seed, arm) are skipped on rerun")
     ap.add_argument("--jobs", type=int, default=1, help="model episodes run in parallel")
@@ -311,7 +398,7 @@ def main(call=None, argv=None):
     def one(job):
         cell, seed, arm = job
         q, dep = CELLS[cell]
-        e = (forest_episode(seed, q, dep, arm == "forest") if arm.startswith("forest")
+        e = (forest_episode(seed, q, dep, KERNEL_ARMS[arm]) if arm in KERNEL_ARMS
              else model_episode(call, seed, q, dep, arm == "assisted"))
         e["cell"] = cell
         with lock:

@@ -93,8 +93,11 @@ after `paired_gate` accepts it and `authorize` sets an authorized scope inside i
 returns at most one card per role first (`direct_prior`, `negative_prior`, `in_scope_unvalidated`,
 `transfer_candidate`, ...) and marks `inherits_conclusion` only for direct priors.
 
-**Deciding what to test.** `choose_experiment` scores each candidate condition by the entropy of the outcomes
-predicted by the active rivals (hypotheses linked by `competes`) whose scope covers it, and returns the best one.
+**Deciding what to test.** `choose_experiment` scores each candidate condition by the mutual information between
+the outcome and which of the active rivals (hypotheses linked by `competes`) whose scope covers it is right, and
+returns the best one. Predictions may be exact outcomes or outcome distributions (runs that fail or read noisily),
+and the caller may weight rivals by credence; with exact predictions and equal weights the score is the entropy of
+the predicted outcomes.
 The forest changes decisions only through this structure; it is never pasted into a prompt as memory.
 
 ## Design rules for contributors

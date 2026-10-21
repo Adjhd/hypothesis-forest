@@ -200,6 +200,12 @@ class LogAndPriorsTest(unittest.TestCase):
         best, bits = choose_experiment(f, doses, lambda h, e: int(e[1:]) >= int(h.id[1:]))
         self.assertEqual((best, bits), ("x1", 1.0))  # x1 splits thresholds {0,1} | {2,3}
         self.assertEqual(choose_experiment(f, {"far": Scope({"protocol": "salt"})}, lambda h, e: 0), (None, 0.0))
+        # a run that fails half the time and then reads low carries less, and credence moves the best dose
+        noisy = lambda h, e: {True: 0.5, False: 0.5} if int(e[1:]) >= int(h.id[1:]) else {False: 1.0}  # noqa: E731
+        self.assertLess(choose_experiment(f, doses, noisy)[1], 1.0)
+        weight = lambda h, e: 1.0 if h.id in ("T2", "T3") else 0.0  # noqa: E731
+        self.assertEqual(choose_experiment(f, doses, lambda h, e: int(e[1:]) >= int(h.id[1:]), weight=weight),
+                         ("x2", 1.0))  # only T2 and T3 still carry weight
 
     def test_paired_gate(self):
         self.assertAlmostEqual(paired_gate([(0, 1)] * 5)["p_value"], 1 / 32)

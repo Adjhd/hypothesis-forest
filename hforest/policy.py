@@ -2,8 +2,11 @@
 
 The forest steers what to test only through declared rivals: active hypotheses
 linked by ``competes`` relations. An experiment is worth running in proportion
-to how evenly the rivals that apply to its condition disagree on its outcome
-(the expected information gain under a uniform prior and noise-free outcomes).
+to the information its outcome carries about which rival is right: the mutual
+information between rival and outcome. Predictions may be exact outcomes or
+distributions over outcomes (an observation model with failures or noise), and
+rivals may carry credence weights; with exact predictions and equal weights this
+is the entropy of the rivals' predictions.
 """
 from __future__ import annotations
 
@@ -33,27 +36,52 @@ def rival_groups(forest) -> list[list[str]]:
     return [g for g in groups.values() if len(g) > 1]
 
 
+def _entropy(probs) -> float:
+    return -sum(p * math.log2(p) for p in probs if p > 0)
+
+
 def disagreement(outcomes) -> float:
     """Entropy in bits of the predicted outcomes; 0 when all rivals agree."""
     counts = Counter(outcomes)
     n = sum(counts.values())
-    return -sum(c / n * math.log2(c / n) for c in counts.values()) if n else 0.0
+    return _entropy(c / n for c in counts.values()) if n else 0.0
 
 
-def choose_experiment(forest, experiments: dict, predict, cost=None, consider=None) -> tuple:
+def information(predictions, weights=None) -> float:
+    """Mutual information in bits between rival and outcome.
+
+    Each prediction is an outcome or a dict {outcome: probability}; ``weights`` are
+    unnormalized credences (equal if omitted).
+    """
+    dists = [p if isinstance(p, dict) else {p: 1.0} for p in predictions]
+    weights = list(weights) if weights is not None else [1.0] * len(dists)
+    z = sum(weights)
+    if not z:
+        return 0.0
+    mix = Counter()
+    for d, w in zip(dists, weights):
+        for outcome, p in d.items():
+            mix[outcome] += w / z * p
+    return _entropy(mix.values()) - sum(w / z * _entropy(d.values()) for d, w in zip(dists, weights))
+
+
+def choose_experiment(forest, experiments: dict, predict, cost=None, consider=None, weight=None) -> tuple:
     """Return (experiment id, bits per unit cost) that best separates rivals, or (None, 0.0).
 
     ``experiments`` maps ids to condition Scopes; ``predict(hypothesis, experiment_id)``
-    returns that hypothesis's predicted outcome. Rivals whose scope does not cover
-    the condition make no prediction there. ``consider(hypothesis, experiment_id)`` can
-    further drop rivals the caller already doubts, e.g. on unreplicated readings.
+    returns that hypothesis's predicted outcome or outcome distribution. Rivals whose
+    scope does not cover the condition make no prediction there. ``consider(hypothesis,
+    experiment_id)`` can drop rivals the caller already doubts; ``weight(hypothesis,
+    experiment_id)`` gives the caller's credence in a rival (it never changes the forest).
     """
     groups, best, best_score = rival_groups(forest), None, 0.0
     for eid, condition in experiments.items():
-        bits = sum(disagreement([predict(forest.hypotheses[i], eid) for i in g
-                                 if covers(forest.hypotheses[i].scope, condition)
-                                 and (consider is None or consider(forest.hypotheses[i], eid))]) for g in groups)
+        bits = 0.0
+        for g in groups:
+            hs = [forest.hypotheses[i] for i in g if covers(forest.hypotheses[i].scope, condition)
+                  and (consider is None or consider(forest.hypotheses[i], eid))]
+            bits += information([predict(h, eid) for h in hs], [weight(h, eid) for h in hs] if weight else None)
         score = bits / (cost(eid) if cost else 1.0)
-        if score > best_score:
+        if score > best_score + 1e-12:
             best, best_score = eid, score
     return best, best_score
