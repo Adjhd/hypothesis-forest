@@ -6,13 +6,18 @@ thresholds follow one law: t = base + slope * f_j, or two such rules split by a 
 fail as in the threshold world (a failed run reads "low"; the ops alarm catches most failures).
 Success is predicting every held-out threshold, which needs the law, not one condition at a time.
 
-Agents (all language-model agents see the same prompt; only "assisted" also sees the forest):
+World size, budget and memory are set by configure(); with a window the model sees only the most recent
+runs plus its own notes, while the forest keeps every record.
+
+Agents (all language-model agents see the same prompt; "assisted" and "delegated" also see the forest):
   flat      a language model that proposes candidate laws, picks runs and predicts thresholds.
   assisted  the same model; the laws it proposes are registered in a hypothesis forest as rivals.
             A low reading is admitted once its silent-failure risk is small; a law contradicted by
             an admitted run is narrowed away from that condition, so it no longer covers the domain.
             The forest shows each law's state and credence and suggests the run that carries the
             most information about which consistent law is right.
+  delegated the same, except that the forest runs its own suggestion every turn: the model proposes
+            laws and answers, the forest chooses the experiments.
 
   python experiments/mechanism_world.py --worlds 50   # scripted stand-in for the model, no model calls
 """
@@ -34,10 +39,19 @@ from hforest import Forest, Record, Scope, choose_experiment  # noqa: E402
 from threshold_world import (ADMIT_RISK, DOSES, FALSE_ALARM, RECALL, THRESHOLDS, allowed,  # noqa: E402
                              failure_rate, likelihood, openai_call)
 
-FEATURES = {f"c{i:02d}": bits for i, bits in enumerate(itertools.product((0, 1), repeat=4))}
-CONDITIONS, BUDGET, OPEN, OPEN_PRIOR = tuple(FEATURES), 16, "L0", 0.3
+OPEN, OPEN_PRIOR = "L0", 0.3
 SPLIT_PRIOR = 0.01  # a split law states two rules and a feature: an Occam penalty on its prior weight
 CELLS = {"clean": 0.0, "failures": 0.2}
+
+
+def configure(features=4, testable=8, budget=16, window=None):
+    global NF, FEATURES, CONDITIONS, TESTABLE, BUDGET, WINDOW
+    NF, TESTABLE, BUDGET, WINDOW = features, testable, budget, window
+    FEATURES = {f"c{i:02d}": bits for i, bits in enumerate(itertools.product((0, 1), repeat=features))}
+    CONDITIONS = tuple(FEATURES)
+
+
+configure()
 
 
 # ------------------------------------------------------------------ laws
@@ -61,7 +75,7 @@ def law_thresholds(law):
 
 def simple_rules():
     out = [{"base": a, "slope": 0, "feature": None} for a in THRESHOLDS]
-    for j, b, a in itertools.product(range(4), (-3, -2, -1, 1, 2, 3), THRESHOLDS):
+    for j, b, a in itertools.product(range(NF), (-3, -2, -1, 1, 2, 3), THRESHOLDS):
         if 0 <= a + b <= 6:
             out.append({"base": a, "slope": b, "feature": f"f{j}"})
     return out
@@ -73,8 +87,8 @@ def make_world(seed):
         law = rng.choice(rules)
     else:
         r0, r1 = rng.sample(rules, 2)
-        law = {"split_on": f"f{rng.randrange(4)}", "if_0": r0, "if_1": r1}
-    testable = sorted(rng.sample(CONDITIONS, 8))
+        law = {"split_on": f"f{rng.randrange(NF)}", "if_0": r0, "if_1": r1}
+    testable = sorted(rng.sample(CONDITIONS, TESTABLE))
     return law, law_thresholds(law), testable
 
 
@@ -118,7 +132,7 @@ class LawForest:
             self.forest.edit("unexplained_observation", "propose", [hid], reason, author=author, hypothesis={
                 "id": hid, "statement": json.dumps(law, sort_keys=True), "scope": self.everywhere,
                 "predictions": [json.dumps(t, sort_keys=True)], "falsifiers": ["an admitted reading opposite to t_c"],
-                "mechanism": json.dumps(law, sort_keys=True), "variables": ["f0", "f1", "f2", "f3", "dose"],
+                "mechanism": json.dumps(law, sort_keys=True), "variables": [f"f{j}" for j in range(NF)] + ["dose"],
                 "endpoints": ["reading"], "plans": ["P-dose"]}, link=parent and {"kind": "derived_from", "to": parent})
             self.forest.edit("unresolved_competition", "link_competition", [hid, OPEN], "rival laws",
                              observable="reading")
@@ -145,7 +159,7 @@ class LawForest:
             failed = self.failed_in(h)
             if "split_on" in law or not 0 < len(failed) <= 3 or len(self.explained(h, set(CONDITIONS))) < 2:
                 continue
-            hints += [(h, s, FEATURES[min(failed)][s]) for s in range(4) if len({FEATURES[c][s] for c in failed}) == 1]
+            hints += [(h, s, FEATURES[min(failed)][s]) for s in range(NF) if len({FEATURES[c][s] for c in failed}) == 1]
         return hints
 
     def split_failures(self):
@@ -278,26 +292,30 @@ class LawForest:
 
 # ------------------------------------------------------------ model agents
 SYSTEM = """You are discovering a hidden law from experiments.
-There are 16 conditions c00..c15. Each is defined by four binary features f0..f3 (table in "conditions"). Only the 8 conditions listed in "testable" can be run.
+There are {n} conditions c00..{last}. Each is defined by {nf} binary features {names} (table in "conditions"). Only the {k} conditions listed in "testable" can be run.
 A run at integer dose x (0..5) in condition c reads "high" if x >= t_c and "low" otherwise, where t_c is an integer threshold in 0..6.
 The thresholds follow one law over the features, of one of two forms:
   a rule  {{"base": b, "slope": s, "feature": "f1"}}  meaning t = b + s * f1 (slope may be negative; use "feature": null for a constant), or
   a split {{"split_on": "f2", "if_0": rule, "if_1": rule}}  meaning one rule where f2 = 0 and another where f2 = 1.
 Some runs fail. A failed run reads "low" whatever the dose. The operations log raises "ops_alarm": true on most failed runs, but misses some and occasionally alarms on a good run.
-You have at most {budget} runs. You are scored on the thresholds of the 8 conditions you cannot run, so you must find the law.
+You have at most {budget} runs. You are scored on the thresholds of the {held} conditions you cannot run, so you must find the law.
 Each turn return only JSON:
-{{"laws": [up to 10 candidate laws you still consider, most likely first], "thresholds": {{"c00": t, ... one integer for each of the 16 conditions}}, "action": {{"condition": "c03", "dose": 2}}, "notes": "..."}}
-Use "action": "stop" when you are done. Your last "thresholds" are your answer."""
+{{"laws": [up to 10 candidate laws you still consider, most likely first], "thresholds": {{"c00": t, ... one integer for each of the {n} conditions}}, "action": {{"condition": "c03", "dose": 2}}, "notes": "..."}}
+Use "action": "stop" when you are done. Your last "thresholds" are your answer.{memory}"""
+MEMORY = """
+You see only the {window} most recent runs ("recent_runs"). "notes" is your own memory: whatever you write is returned to you next turn, cut to 1200 characters. Keep there what you will need from earlier runs."""
 ASSIST = """
 You also receive "forest": the state kept by a hypothesis forest over every law you have proposed, plus split laws it assembles from them. A high reading without alarm is admitted at once; a low one only once the chance it is a silent failure is small (shown in "low_readings_awaiting_admission"). A law contradicted by an admitted reading is marked with the conditions where it failed; "split_hints" name laws whose failures all share one feature value, where a law for that region may complete them. "credence" weighs the consistent laws by all runs under the estimated failure rate, a split law starting lower than a single rule; "credence_no_proposed_law_is_right" is the weight left for laws nobody has proposed yet. "suggested_next" is the run that carries the most information about which of these is right. You may use or ignore it."""
+DELEGATE = """
+In this setting the forest runs its own "suggested_next" every turn; your "action" is ignored and may be omitted. Spend your effort on proposing laws and on your thresholds."""
 
 
-def parse(out, testable):
+def parse(out, testable, delegated=False):
     th, action = out.get("thresholds"), out.get("action")
     if not isinstance(th, dict) or set(th) != set(CONDITIONS) or any(t not in THRESHOLDS or not isinstance(t, int)
                                                                        for t in th.values()):
         return None
-    if action != "stop" and not (isinstance(action, dict) and action.get("condition") in testable
+    if not delegated and action != "stop" and not (isinstance(action, dict) and action.get("condition") in testable
                                  and isinstance(action.get("dose"), int) and action["dose"] in DOSES):
         return None
     laws = out.get("laws") if isinstance(out.get("laws"), list) else []
@@ -311,21 +329,29 @@ def score(truth, th, testable):
             "law_exact": all(th[c] == truth[c] for c in CONDITIONS)}
 
 
-def model_episode(call, seed, q, assisted, recombine=True):
+def model_episode(call, seed, q, mode, recombine=True):
+    """mode: flat, assisted or delegated."""
     law, truth, testable = make_world(seed)
+    assisted, delegated = mode != "flat", mode == "delegated"
     state = LawForest(testable, recombine) if assisted else None
-    system = SYSTEM.format(budget=BUDGET) + (ASSIST if assisted else "")
+    memory = MEMORY.format(window=WINDOW) if WINDOW else ""
+    system = SYSTEM.format(budget=BUDGET, n=len(CONDITIONS), last=CONDITIONS[-1], nf=NF, k=len(testable),
+                           held=len(CONDITIONS) - len(testable), names=", ".join(f"f{j}" for j in range(NF)),
+                           memory=memory) + (ASSIST if assisted else "") + (DELEGATE if delegated else "")
     runs, steps, notes, th = [], [], "", {c: 0 for c in CONDITIONS}
     while True:
-        payload = {"conditions": {c: dict(zip(("f0", "f1", "f2", "f3"), FEATURES[c])) for c in CONDITIONS},
+        payload = {"conditions": {c: {f"f{j}": v for j, v in enumerate(FEATURES[c])} for c in CONDITIONS},
                    "testable": testable, "runs": runs, "notes": notes, "runs_left": BUDGET - len(runs)}
+        if WINDOW:
+            payload.pop("runs")
+            payload.update(recent_runs=runs[-WINDOW:], earlier_runs_not_shown=max(0, len(runs) - WINDOW))
         if assisted:
             payload["forest"] = state.view()
         decision, error = None, None
         for _ in range(2):
             try:
                 out = call(system, payload if error is None else dict(payload, last_error=error))
-                decision = parse(out, testable)
+                decision = parse(out, testable, delegated)
             except Exception as exc:  # transport or JSON failure: one retry, then the episode stops
                 error = f"{type(exc).__name__}: {exc}"[:200]
                 continue
@@ -333,8 +359,7 @@ def model_episode(call, seed, q, assisted, recombine=True):
                 break
             error = "invalid output; follow the JSON format exactly"
         if decision is None:
-            return {"arm": "assisted" if assisted else "flat", "seed": seed, "law": law, "truth": truth,
-                    "runs": len(runs), "final": th, **score(truth, th, testable), "invalid": error, "steps": steps}
+            return {"arm": mode, "seed": seed, "law": law, "truth": truth, "runs": len(runs), "final": th, **score(truth, th, testable), "invalid": error, "steps": steps}
         th, action, laws = decision
         notes = str(out.get("notes") or "")[:1200]
         valid = [x for x in laws if isinstance(x, dict) and law_thresholds(x)]
@@ -343,14 +368,17 @@ def model_episode(call, seed, q, assisted, recombine=True):
         if assisted:
             step["suggested"] = payload["forest"]["suggested_next"]
             step["new_laws"] = state.propose(valid, "model")
+        if delegated and len(runs) < BUDGET:
+            nxt = state.suggest()[0]
+            least = min(testable, key=lambda c: sum(r["condition"] == c for r in runs))
+            action = step["action"] = nxt or {"condition": least, "dose": 3}
         steps.append(step)
         if action == "stop" or len(runs) >= BUDGET:
             break
         runs.append(run_once(truth, action["condition"], action["dose"], q, seed, len(runs) + 1))
         if assisted:
             state.observe(runs[-1])
-    return {"arm": "assisted" if assisted else "flat", "seed": seed, "law": law, "truth": truth, "runs": len(runs),
-            "final": th, **score(truth, th, testable), "steps": steps}
+    return {"arm": mode, "seed": seed, "law": law, "truth": truth, "runs": len(runs), "final": th, **score(truth, th, testable), "steps": steps}
 
 
 def scripted_call(system, payload):
@@ -362,15 +390,15 @@ def scripted_call(system, payload):
     for hint in forest.get("split_hints", [])[:1]:
         feature, value = hint.split(" fails only where ")[1].split(":")[0].split(" = ")
         region = {c for c in CONDITIONS if FEATURES[c][int(feature[1:])] == int(value)}
-    runs = [r for r in payload["runs"] if not r["ops_alarm"] and r["condition"] in region]
+    runs = [r for r in payload.get("runs", payload.get("recent_runs")) if not r["ops_alarm"] and r["condition"] in region]
     fits = [law for law in simple_rules() if all((r["dose"] >= law_thresholds(law)[r["condition"]]) ==
                                                  (r["reading"] == "high") for r in runs)]
-    laws = random.Random(json.dumps(payload["runs"])).sample(fits, min(10, len(fits)))
+    laws = random.Random(json.dumps(runs) + str(payload["runs_left"])).sample(fits, min(10, len(fits)))
     nxt = forest.get("suggested_next")
     action = {"condition": nxt["condition"], "dose": nxt["dose"]} if nxt and payload["runs_left"] else "stop"
     th = forest.get("thresholds_under_most_credible_law") or (law_thresholds(laws[0]) if laws else
                                                                {c: 3 for c in CONDITIONS})
-    if not payload["runs"] and action == "stop":
+    if payload["runs_left"] == BUDGET and action == "stop":
         action = {"condition": payload["testable"][0], "dose": 3}
     return {"laws": laws, "thresholds": th, "action": action, "notes": ""}
 
@@ -393,11 +421,16 @@ def main(call=None, argv=None):
     ap.add_argument("--worlds", type=int, default=20)
     ap.add_argument("--seed0", type=int, default=0)
     ap.add_argument("--arms", default="scripted_forest,scripted_plain",
-                    help="comma list of flat, assisted, scripted_forest, scripted_plain (no splitting)")
+                    help="comma list of flat, assisted, delegated, scripted_forest, scripted_plain (no splitting)")
+    ap.add_argument("--features", type=int, default=4)
+    ap.add_argument("--testable", type=int, default=8)
+    ap.add_argument("--budget", type=int, default=16)
+    ap.add_argument("--window", type=int, default=0, help="model agents see only this many recent runs (0: all)")
     ap.add_argument("--cells", default=",".join(CELLS))
     ap.add_argument("--out", default="")
     ap.add_argument("--jobs", type=int, default=1)
     args = ap.parse_args(argv)
+    configure(args.features, args.testable, args.budget, args.window or None)
     episodes, lock = [], threading.Lock()
     if args.out and Path(args.out).exists():
         episodes = [json.loads(line) for line in Path(args.out).read_text().splitlines() if line.strip()]
@@ -408,10 +441,10 @@ def main(call=None, argv=None):
     def one(job):
         cell, seed, arm = job
         if arm.startswith("scripted"):
-            e = model_episode(scripted_call, seed, CELLS[cell], True, recombine=arm == "scripted_forest")
+            e = model_episode(scripted_call, seed, CELLS[cell], "assisted", recombine=arm == "scripted_forest")
             e["arm"] = arm
         else:
-            e = model_episode(call, seed, CELLS[cell], arm == "assisted")
+            e = model_episode(call, seed, CELLS[cell], arm)
         e["cell"] = cell
         with lock:
             episodes.append(e)
