@@ -14,7 +14,8 @@ hforest/
   promotion.py  paired sign-test gate that authorizes a hypothesis for use
 examples/steel_demo.py   formation, evolution and merge on a toy weathering-steel forest
 examples/regime_pilot.py when discrimination, failure gating and splitting pay off (toy world)
-experiments/threshold_world.py  controlled discovery task: kernel agent vs model agents, error scoring
+experiments/threshold_world.py  thresholds under silent run failures: admission discipline
+experiments/mechanism_world.py  feature-dependent laws, history beyond the context: experiment selection
 tests/test_forest.py     the rules as executable checks
 ```
 
@@ -98,7 +99,20 @@ the outcome and which of the active rivals (hypotheses linked by `competes`) who
 returns the best one. Predictions may be exact outcomes or outcome distributions (runs that fail or read noisily),
 and the caller may weight rivals by credence; with exact predictions and equal weights the score is the entropy of
 the predicted outcomes.
-The forest changes decisions only through this structure; it is never pasted into a prompt as memory.
+The forest changes decisions only through this structure. A model sees a compact view of the current state
+(laws still consistent, credences, the suggested next run), never the raw log as memory.
+
+## Experiments
+
+Both worlds have a known ground truth and exact scoring, and run with or without a model
+(`python experiments/mechanism_world.py --help`). With a model, the same model works flat (it sees the recent
+runs only) or with the forest. In `threshold_world` some runs fail silently and read low; the forest admits a
+low reading only once its risk of being a failure is small. In `mechanism_world` the threshold of each condition
+follows a law over binary features, only part of the conditions can be tested, and the model sees only the last
+runs; in the delegated arm the forest picks every run and the model proposes laws and gives the final answer.
+Preregistered runs used commit `317d0c6` (threshold world) and `a216269` (mechanism world). The gain appears when
+runs fail silently or the history exceeds what the model sees; on short tasks with the full history visible
+the arms do not differ.
 
 ## Design rules for contributors
 
