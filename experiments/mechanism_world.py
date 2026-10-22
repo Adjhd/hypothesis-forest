@@ -273,16 +273,16 @@ class LawForest:
 
     def view(self):
         w, nxt = self.credence(), self.suggest()
-        laws = []
-        for h, (law, _) in self.laws.items():
-            hyp = self.forest.hypotheses[h]
-            failed = sorted(set(CONDITIONS) - set(hyp.scope.dims["condition"]))
-            laws.append({"id": h, "law": law, "consistent": not failed, "contradicted_in": failed,
-                         "credence": round(w.get(h, 0.0), 3)})
-        best = max((h for h in w if h != OPEN), key=w.get, default=None)
+        top = sorted((h for h in w if h != OPEN), key=lambda h: -w[h])[:10]
+        refuted = [h for h in self.laws if self.failed_in(h)]
+        best = top[0] if top else None
         hints = [f"{h} fails only where f{s} = {v}: a law for that region may complete it"
                  for h, s, v in self.split_hints()][:8]
-        return {"laws": laws, "credence_no_proposed_law_is_right": round(w[OPEN], 3), "split_hints": hints,
+        return {"consistent_laws": [{"id": h, "law": self.laws[h][0], "credence": round(w[h], 3)} for h in top],
+                "consistent_laws_not_shown": max(0, len(w) - 1 - len(top)), "contradicted_laws": len(refuted),
+                "recently_contradicted": [{"id": h, "law": self.laws[h][0], "contradicted_in": sorted(self.failed_in(h))}
+                                          for h in refuted[-5:]],
+                "credence_no_proposed_law_is_right": round(w[OPEN], 3), "split_hints": hints,
                 "estimated_failure_rate": round(self.q(), 3),
                 "low_readings_awaiting_admission": sorted(r["run"] for rs in self.pending.values() for r in rs),
                 "alarmed_runs_not_used": [r["run"] for r in self.runs if r["ops_alarm"]],
@@ -305,7 +305,7 @@ Use "action": "stop" when you are done. Your last "thresholds" are your answer.{
 MEMORY = """
 You see only the {window} most recent runs ("recent_runs"). "notes" is your own memory: whatever you write is returned to you next turn, cut to 1200 characters. Keep there what you will need from earlier runs."""
 ASSIST = """
-You also receive "forest": the state kept by a hypothesis forest over every law you have proposed, plus split laws it assembles from them. A high reading without alarm is admitted at once; a low one only once the chance it is a silent failure is small (shown in "low_readings_awaiting_admission"). A law contradicted by an admitted reading is marked with the conditions where it failed; "split_hints" name laws whose failures all share one feature value, where a law for that region may complete them. "credence" weighs the consistent laws by all runs under the estimated failure rate, a split law starting lower than a single rule; "credence_no_proposed_law_is_right" is the weight left for laws nobody has proposed yet. "suggested_next" is the run that carries the most information about which of these is right. You may use or ignore it."""
+You also receive "forest": the state kept by a hypothesis forest over every law you have proposed, plus split laws it assembles from them. A high reading without alarm is admitted at once; a low one only once the chance it is a silent failure is small (shown in "low_readings_awaiting_admission"). It shows the most credible consistent laws and the most recently contradicted ones, with the conditions where an admitted reading refuted them; "split_hints" name laws whose failures all share one feature value, where a law for that region may complete them. "credence" weighs the consistent laws by all runs under the estimated failure rate, a split law starting lower than a single rule; "credence_no_proposed_law_is_right" is the weight left for laws nobody has proposed yet. "suggested_next" is the run that carries the most information about which of these is right. You may use or ignore it."""
 DELEGATE = """
 In this setting the forest runs its own "suggested_next" every turn; your "action" is ignored and may be omitted. Spend your effort on proposing laws and on your thresholds."""
 
