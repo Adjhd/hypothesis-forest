@@ -487,8 +487,13 @@ def episode(call, env_name, seed, arm, checkpoints=(0, 5, 10), num_evals=10, win
     calls = {"n": 0}
 
     def counted(system, payload):
+        """One retry of the same request after a transport failure; a second failure ends the episode."""
         calls["n"] += 1
-        return call(system, payload)
+        try:
+            return call(system, payload)
+        except Exception:  # noqa: BLE001 - the gateway's error type is not importable here
+            calls["retries"] = calls.get("retries", 0) + 1
+            return call(system, payload)
 
     scientist = gateway_experimenter(counted) if arm == "flat" else ForestScientist(counted, env_name, goal, seed, window)
     scientist.set_system_message(goal.get_system_message(True))
@@ -498,7 +503,8 @@ def episode(call, env_name, seed, arm, checkpoints=(0, 5, 10), num_evals=10, win
     out = {"env": env_name, "seed": seed, "arm": arm, "checkpoints": list(checkpoints), "mse": errors,
            "standardized": [(e - goal.norm_mu) / goal.norm_sigma for e in errors],
            "queries": [str(q) for q in queries], "observations": [str(o) for o in observations],
-           "valid_measurements": int(sum(map(bool, successes))), "calls": calls["n"]}
+           "valid_measurements": int(sum(map(bool, successes))), "calls": calls["n"],
+           "transport_retries": calls.get("retries", 0)}
     if arm != "flat":
         X = [np.atleast_1d(np.asarray(p[0], dtype=float)) for p in goal.eval_points]
         gts = np.array([float(p[-1]) for p in goal.eval_points])
@@ -532,7 +538,10 @@ _CALL = None
 
 
 def _one(job):
-    return episode(_CALL, *job)
+    try:
+        return episode(_CALL, *job)
+    except Exception as exc:  # noqa: BLE001 - an invalid episode is recorded and rerun, not fatal
+        return {"env": job[0], "seed": job[1], "arm": job[2], "invalid": True, "error": f"{type(exc).__name__}: {exc}"[:300]}
 
 
 def main(call=None, argv=None):
@@ -554,13 +563,13 @@ def main(call=None, argv=None):
     cps = tuple(int(c) for c in a.checkpoints.split(","))
     done = set()
     if a.out and Path(a.out).exists():
-        done = {(e["env"], e["seed"], e["arm"]) for e in map(json.loads, open(a.out))}
+        done = {(e["env"], e["seed"], e["arm"]) for e in map(json.loads, open(a.out)) if not e.get("invalid")}
     jobs = [(e, s, arm, cps, a.evals, a.window) for e in a.envs.split(",")
             for s in range(a.seed0, a.seed0 + a.seeds) for arm in a.arms.split(",") if (e, s, arm) not in done]
     sink = open(a.out, "a") if a.out else None
     with multiprocessing.get_context("fork").Pool(a.jobs) as pool:
         for ep in pool.imap_unordered(_one, jobs):
-            print(json.dumps({k: ep[k] for k in ("env", "seed", "arm", "standardized", "calls")}), flush=True)
+            print(json.dumps({k: ep.get(k) for k in ("env", "seed", "arm", "standardized", "calls", "error")}), flush=True)
             if sink:
                 sink.write(json.dumps(ep) + "\n")
                 sink.flush()
