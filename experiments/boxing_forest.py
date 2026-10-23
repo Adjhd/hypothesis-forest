@@ -39,7 +39,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from hforest import Forest, Record, Scope, choose_experiment  # noqa: E402
 
 OPEN, OPEN_PRIOR, CONTRADICT_FACTOR = "L0", 0.3, 1000.0
-CANDIDATES, CONSIDERED, BINS, NEW_LAWS, FLOOR = 64, 8, 40, 4, -50.0
+RECALL, FALSE_ALARM = 0.8, 0.05  # the ops alarm flags this share of failed and of good measurements
+CANDIDATES, CONSIDERED, NEW_LAWS, FLOOR = 64, 8, 4, -50.0
+EDGE_Z = np.array([-2.5, -1.2, -0.4, 0.4, 1.2, 2.5])
 SCHEMA = {"type": "object"}
 
 # env name -> (module, env class, goal class, env params, input names, input box, outcome kind)
@@ -103,8 +105,14 @@ def residuals(law, X, y, theta, kind):
     return np.where(np.isfinite(r), r, 1e6)
 
 
-def fit(law, X, y, kind, rng):
-    """Least squares (deviance residuals for counts) from the proposed values and three jittered restarts."""
+def robust_scale(r):
+    return 1.4826 * float(np.median(np.abs(r - np.median(r)))) if len(r) else 0.0
+
+
+def fit(law, X, y, kind, rng, robust=False):
+    """Least squares (deviance residuals for counts) from the proposed values and three jittered restarts.
+    With robust=True the plain fit is refined under a soft-l1 loss scaled to its median absolute residual,
+    so that a few wrong readings cannot drag the law."""
     if not law.params or not len(y):
         return law.init
     best, starts = None, [law.init] + [law.init * np.exp(rng.normal(0, 0.7, len(law.init))) + rng.normal(0, 0.1, len(law.init))
@@ -116,7 +124,16 @@ def fit(law, X, y, kind, rng):
             continue
         if best is None or r.cost < best.cost:
             best = r
-    return law.init if best is None else best.x
+    if best is None:
+        return law.init
+    if robust and len(y) > len(law.params):
+        scale = max(robust_scale(best.fun), 1e-3 * open_scale(y))
+        try:
+            best = least_squares(lambda th: residuals(law, X, y, th, kind), best.x, method="trf", loss="soft_l1",
+                                 f_scale=scale, max_nfev=300)
+        except (ValueError, FloatingPointError):
+            pass
+    return best.x
 
 
 def open_scale(y):
@@ -132,10 +149,10 @@ def jacobian(law, X, theta):
     return np.column_stack(cols) if cols else np.zeros((len(X), 0))
 
 
-def law_predictive(law, X, y, theta, kind, Xq):
+def law_predictive(law, X, y, theta, kind, Xq, robust=False):
     """(mean, scale, degrees of freedom) of a new measurement at Xq: the noise plus the fitted parameters'
     uncertainty, linearized. Real responses get a Student t with m - k degrees of freedom; counts a Poisson
-    variance plus parameter uncertainty."""
+    variance plus parameter uncertainty. With robust=True the noise comes from the median absolute residual."""
     m, k = len(y), len(law.params)
     mu, G, Gq = law(Xq, theta), jacobian(law, X, theta), jacobian(law, Xq, theta)
     with np.errstate(all="ignore"):
@@ -143,7 +160,9 @@ def law_predictive(law, X, y, theta, kind, Xq):
             info = (G / np.maximum(law(X, theta), 1e-9)[:, None]).T @ G
             noise, cov, dof = np.maximum(mu, 0.25), np.linalg.pinv(info), math.inf
         else:
-            s2 = max(float(np.sum((law(X, theta) - y) ** 2)) / (m - k), (1e-3 * open_scale(y)) ** 2)
+            r = law(X, theta) - y
+            sse = robust_scale(r) ** 2 * m if robust else float(np.sum(r ** 2))
+            s2 = max(sse / (m - k), (1e-3 * open_scale(y)) ** 2)
             noise, cov, dof = s2, s2 * np.linalg.pinv(G.T @ G), m - k
         var = noise + np.einsum("ij,jk,ik->i", Gq, cov, Gq)
     return mu, np.sqrt(np.maximum(var, 1e-12)), dof
@@ -166,9 +185,14 @@ def log_density(v, mu, scale, dof=math.inf):
 class BoxForest:
     """Candidate laws as rival hypotheses over the environment's input space; measurements as records."""
 
-    def __init__(self, env_name, seed):
+    def __init__(self, env_name, seed, failure_rate=0.0):
         _, _, _, _, self.inputs, self.box, self.kind = ENVS[env_name]
         self.rng, self.laws, self.X, self.y, self.score = np.random.default_rng(seed), {}, [], [], {}
+        self.n, self.admitted_ids, self.alarmed = 0, [], []
+        # share of un-alarmed readings that are silent failures under the declared failure model
+        q = failure_rate
+        self.eps = q * (1 - RECALL) / (q * (1 - RECALL) + (1 - q) * (1 - FALSE_ALARM)) if q else 0.0
+        self.robust = q > 0
         self.domain = Scope({"environment": env_name})
         f = self.forest = Forest()
         f.add_plan({"id": "P-measure", "objective": "find the response law", "protocol": "one measurement at an input",
@@ -185,13 +209,23 @@ class BoxForest:
         n = len(self.y) if n is None else n
         return np.array(self.X[:n], dtype=float).reshape(n, len(self.inputs)), np.array(self.y[:n], dtype=float)
 
-    def observe(self, x, value):
+    def observe(self, x, value, alarm=False):
+        """An alarmed reading is an infrastructure record and never evidence. Every other reading is admitted;
+        under a declared failure model it is scored as possibly a silent failure (see _mixed)."""
+        self.n += 1
+        rid = f"m{self.n}"
+        self.forest.add_record(Record(rid, json.dumps({"input": list(map(float, x)), "response": float(value),
+                                                       "ops_alarm": bool(alarm)}),
+                                      self.domain, "boxing-gym", tier="E3",
+                                      kind="infrastructure" if alarm else "scientific"))
+        if alarm:
+            self.alarmed.append(rid)
+            return
+        reason = (f"no ops alarm; scored with a {self.eps:.3f} chance of being a silent failure" if self.eps
+                  else "the environment reports no execution failures")
+        self.forest.add_record(Record(rid + "+", reason, self.domain, "boxing-gym", tier="E4", admits=rid))
+        self.admitted_ids.append(rid + "+")
         k = len(self.y)
-        rid = f"m{k + 1}"
-        self.forest.add_record(Record(rid, json.dumps({"input": list(map(float, x)), "response": float(value)}),
-                                      self.domain, "boxing-gym", tier="E3"))
-        self.forest.add_record(Record(rid + "+", "the environment reports no execution failures", self.domain,
-                                      "boxing-gym", tier="E4", admits=rid))
         X, y = self.arrays(k)
         xi = np.array(x, dtype=float).reshape(1, -1)
         self.score[OPEN] += self._open_term(y, value)
@@ -205,20 +239,28 @@ class BoxForest:
     def _open_term(y, value):
         return log_density(value, y.mean() if len(y) else 0.0, open_scale(y))
 
+    def _mixed(self, law_term, open_term):
+        """A silent failure reads like a response at some other input, which the open alternative describes."""
+        if not self.eps:
+            return law_term
+        top = max(law_term, open_term)
+        return top + math.log((1 - self.eps) * math.exp(law_term - top) + self.eps * math.exp(open_term - top))
+
     def _term(self, law, X, y, xi, value):
         """Log density of the next measurement under the law fitted to the earlier ones. Until the law has more
         measurements than parameters its fit is not determined, and it is scored like the open alternative."""
         if len(y) <= len(law.params):
             return self._open_term(y, value)
-        mu, scale, dof = law_predictive(law, X, y, fit(law, X, y, self.kind, self.rng), self.kind, xi)
-        return log_density(value, float(mu[0]), float(scale[0]), dof)
+        theta = fit(law, X, y, self.kind, self.rng, self.robust)
+        mu, scale, dof = law_predictive(law, X, y, theta, self.kind, xi, self.robust)
+        return self._mixed(log_density(value, float(mu[0]), float(scale[0]), dof), self._open_term(y, value))
 
     def _contradict(self):
         best = max(self.score[h] for h in self.alive())
         for h in self.alive():
             if (h != OPEN and self.score[h] < best - math.log(CONTRADICT_FACTOR)
                     and len(self.y) >= len(self.laws[h].params) + 3):
-                evidence = [f"m{i + 1}+" for i in range(len(self.y))]
+                evidence = list(self.admitted_ids)
                 self.forest.edit("admitted_contradiction_in_scope", "attach_evidence", [h],
                                  f"predicted the measurements {CONTRADICT_FACTOR:.0f}x worse than the best rival",
                                  evidence, verdict="contradicts", status="contradicted")
@@ -273,7 +315,7 @@ class BoxForest:
 
     def fitted(self):
         X, y = self.arrays()
-        return {h: fit(law, X, y, self.kind, self.rng) for h, law in self.laws.items() if h in self.alive()}
+        return {h: fit(law, X, y, self.kind, self.rng, self.robust) for h, law in self.laws.items() if h in self.alive()}
 
     def predictive(self, Xq, fitted=None):
         """{rival: (mean, sd)} at the query inputs, fitted to every admitted measurement."""
@@ -284,7 +326,7 @@ class BoxForest:
             if len(y) <= len(self.laws[h].params):  # not determined yet: predicts like the open alternative
                 out[h] = out[OPEN]
                 continue
-            mu, scale, dof = law_predictive(self.laws[h], X, y, theta, self.kind, Xq)
+            mu, scale, dof = law_predictive(self.laws[h], X, y, theta, self.kind, Xq, self.robust)
             out[h] = (mu, spread(scale, dof))
         return out
 
@@ -310,10 +352,10 @@ class BoxForest:
             mus = {h: (m[j], s[j]) for h, (m, s) in pred.items() if np.isfinite(m[j]) and np.isfinite(s[j])}
             if not mus:
                 continue
-            lo = min(m - 4 * s for m, s in mus.values())
-            hi = max(m + 4 * s for m, s in mus.values())
-            edges = np.linspace(lo, hi, BINS + 1) if hi > lo else np.array([lo - 1, lo + 1])
-            dists[j] = {h: {b: float(p) for b, p in enumerate(np.diff(norm.cdf(np.r_[-np.inf, edges[1:-1], np.inf], m, s)))}
+            # each rival contributes its own quantile edges, so one wildly extrapolating law cannot coarsen the
+            # bins that separate the others
+            edges = np.unique(np.concatenate([m + s * EDGE_Z for m, s in mus.values()]))
+            dists[j] = {h: {b: float(p) for b, p in enumerate(np.diff(norm.cdf(np.r_[-np.inf, edges, np.inf], m, s)))}
                         for h, (m, s) in mus.items()}
         options = {str(j): self.domain for j in dists}
         eid, bits = choose_experiment(self.forest, options, lambda h, e: dists[int(e)].get(h.id, {0: 1.0}),
@@ -335,7 +377,7 @@ class BoxForest:
         dead = [h for h in self.laws if h not in w]
         return {"laws": rows, "laws_not_shown": max(0, len(fitted) - limit),
                 "contradicted": [self.laws[h].expr for h in dead[-5:]], "contradicted_count": len(dead),
-                "credence_no_proposed_law_is_right": round(w[OPEN], 4)}
+                "credence_no_proposed_law_is_right": round(w[OPEN], 4), "alarmed_readings_not_used": len(self.alarmed)}
 
 
 # ------------------------------------------------------------------ prompts
@@ -355,6 +397,14 @@ You work with a hypothesis forest that fits your candidate laws to every measure
 question. The forest's laws, their fitted parameters and credence, and their predictions at the queried input are
 given; use them or not. Reply with one JSON object: {"answer": <number>}"""
 
+FAILURES = """
+The instrument sometimes fails silently: about {pct}% of measurements land on a different sample and return a
+plausible-looking but wrong value. An ops alarm flags about {recall}% of failed measurements and about {fa}% of
+good ones; flagged results are marked [ops alarm]."""
+
+WINDOW = """
+You can only see the most recent {w} measurements; earlier ones are not shown to you."""
+
 REPLY = """
 The conversation so far is the JSON list in the user message; its last entry is the message you must answer now.
 Reply with one JSON object {"reply": "<your message>"}, where reply is exactly the text you would send, including
@@ -362,8 +412,9 @@ any <thought>, <observe> or <answer> tags the conversation asks for."""
 
 
 # ------------------------------------------------------------------ agents
-def gateway_experimenter(call):
-    """BoxingGym's LMExperimenter with the chat call replaced by a JSON call(system, payload)."""
+def gateway_experimenter(call, window=None):
+    """BoxingGym's LMExperimenter with the chat call replaced by a JSON call(system, payload). With a window it
+    sends only the last 2 * window messages (one request and one reply per measurement)."""
     from boxing_gym.agents.agent import LMExperimenter
 
     class GatewayExperimenter(LMExperimenter):
@@ -381,7 +432,11 @@ def gateway_experimenter(call):
 
         def prompt_llm(self, request_prompt):
             self.add_message(request_prompt)
-            out = call(self.system + REPLY, {"conversation": self.messages})
+            shown = self.messages[-(2 * window + 1):] if window else self.messages
+            payload = {"conversation": shown}
+            if len(shown) < len(self.messages):
+                payload = {"earlier_messages_not_shown": len(self.messages) - len(shown), **payload}
+            out = call(self.system + REPLY, payload)
             reply = out.get("reply") if isinstance(out, dict) else None
             reply = reply if isinstance(reply, str) else json.dumps(out)
             self.add_message(reply, "assistant")
@@ -393,10 +448,11 @@ def gateway_experimenter(call):
 class ForestScientist:
     """Stands where BoxingGym's scientist stands: the forest picks inputs, the model proposes laws and answers."""
 
-    def __init__(self, call, env_name, goal, seed, window=None):
+    def __init__(self, call, env_name, goal, seed, window=None, failure_rate=0.0):
         self.call, self.goal, self.window = call, goal, window
-        self.state, self.inputs, self.seen, self.proposed_at = BoxForest(env_name, seed), ENVS[env_name][4], 0, None
-        self.system, self.messages, self.all_messages, self.log = None, [], [], []
+        self.state, self.inputs, self.seen, self.proposed_at = (BoxForest(env_name, seed, failure_rate),
+                                                                ENVS[env_name][4], 0, None)
+        self.system, self.messages, self.all_messages, self.log, self.raw = None, [], [], [], []
 
     def set_system_message(self, message):
         self.system = message
@@ -407,31 +463,35 @@ class ForestScientist:
         return env.observed_data if hasattr(env, "observed_data") else env.observation_data
 
     def _sync(self):
-        data = self._data()
-        for x, value in data[self.seen:]:
-            self.state.observe(np.atleast_1d(np.asarray(x, dtype=float)), float(value))
+        data, alarms = self._data(), getattr(self.goal.env, "hf_alarms", [])
+        for i, (x, value) in enumerate(data[self.seen:], self.seen):
+            alarm = bool(alarms[i]) if i < len(alarms) else False
+            x = np.atleast_1d(np.asarray(x, dtype=float))
+            self.state.observe(x, float(value), alarm)
+            self.raw.append({"input": x.tolist() if len(x) > 1 else float(x[0]), "response": float(value),
+                             **({"ops_alarm": True} if alarm else {})})
         self.seen = len(data)
 
     def _records(self):
-        rows = [{"input": x if len(x) > 1 else x[0], "response": v} for x, v in zip(self.state.X, self.state.y)]
+        rows = self.raw
         if self.window and len(rows) > self.window:
             return {"recent_measurements": rows[-self.window:], "earlier_measurements_not_shown": len(rows) - self.window}
         return {"measurements": rows}
 
     def _propose(self):
-        if self.proposed_at == len(self.state.y):
+        if self.proposed_at == len(self.raw):
             return
         system = self.system + DELEGATE.format(inputs=", ".join(self.inputs), n=NEW_LAWS)
         out = self.call(system, {**self._records(), "forest": self.state.view()})
         new, rejected = self.state.propose(out.get("laws") if isinstance(out, dict) else None)
-        self.log.append({"step": len(self.state.y), "new_laws": new, "rejected": rejected})
-        self.proposed_at = len(self.state.y)
+        self.log.append({"step": len(self.raw), "new_laws": new, "rejected": rejected})
+        self.proposed_at = len(self.raw)
 
     def generate_actions(self, experiment_results=None):
         self._sync()
         self._propose()
         x, bits = self.state.suggest()
-        self.log.append({"step": len(self.state.y), "chosen": x, "bits": round(bits, 4),
+        self.log.append({"step": len(self.raw), "chosen": x, "bits": round(bits, 4),
                          "credence_open": round(self.state.credence()[OPEN], 4)})
         text = f"{x[0]:.4f}" if len(x) == 1 else "[" + ", ".join(f"{v:.4f}" for v in x) + "]"
         self.all_messages.append(f"role:forest, messaage:<observe>{text}</observe> ({bits:.3f} bits)")
@@ -478,12 +538,38 @@ def make(env_name):
     return env, getattr(mod, goal_cls)(env)
 
 
-def episode(call, env_name, seed, arm, checkpoints=(0, 5, 10), num_evals=10, window=None):
+def make_faulty(env, seed, q):
+    """Silent failures: with probability q a measurement lands on a different sample and returns the response at
+    a random other input. The ops alarm flags RECALL of failures and FALSE_ALARM of good measurements. The failure
+    schedule depends only on the seed and the measurement count, so every arm meets the same failures."""
+    rng, original, env.hf_alarms, env.hf_failed = random.Random(f"bgfail-{seed}"), env.run_experiment, [], []
+    data = env.observed_data if hasattr(env, "observed_data") else env.observation_data
+
+    def run_experiment(input_string):
+        value, ok = original(input_string)
+        if not ok:
+            return value, ok
+        failed = rng.random() < q
+        alarm = rng.random() < (RECALL if failed else FALSE_ALARM)
+        if failed:
+            value = env.step(env.sample_random_input())
+            value = int(value) if isinstance(data[-1][1], int) else round(float(value), 4)
+            data[-1] = (data[-1][0], value)
+        env.hf_alarms.append(alarm)
+        env.hf_failed.append(failed)
+        return (f"{value} [ops alarm]" if alarm else value), True
+
+    env.run_experiment = run_experiment
+
+
+def episode(call, env_name, seed, arm, checkpoints=(0, 5, 10), num_evals=10, window=None, failure_rate=0.0):
     import logging
     logging.getLogger("pymc").setLevel(logging.ERROR)
     from run_experiment import iterative_experiment  # BoxingGym's own loop
     _seed_everything(seed)
     env, goal = make(env_name)
+    if failure_rate:
+        make_faulty(env, seed, failure_rate)
     calls = {"n": 0}
 
     def counted(system, payload):
@@ -495,12 +581,20 @@ def episode(call, env_name, seed, arm, checkpoints=(0, 5, 10), num_evals=10, win
             calls["retries"] = calls.get("retries", 0) + 1
             return call(system, payload)
 
-    scientist = gateway_experimenter(counted) if arm == "flat" else ForestScientist(counted, env_name, goal, seed, window)
-    scientist.set_system_message(goal.get_system_message(True))
+    scientist = (gateway_experimenter(counted, window) if arm == "flat"
+                 else ForestScientist(counted, env_name, goal, seed, window, failure_rate))
+    system = goal.get_system_message(True)
+    if failure_rate:
+        system += FAILURES.format(pct=round(100 * failure_rate), recall=round(100 * RECALL), fa=round(100 * FALSE_ALARM))
+    if window:
+        system += WINDOW.format(w=window) + (" The forest keeps every record." if arm != "flat" else "")
+    scientist.set_system_message(system)
     results, queries, observations, successes, *_ = iterative_experiment(
         goal, scientist, list(checkpoints), num_evals, True, None, None, False, False)
     errors = [float(r[0][0]) for r in results]
-    out = {"env": env_name, "seed": seed, "arm": arm, "checkpoints": list(checkpoints), "mse": errors,
+    out = {"env": env_name, "seed": seed, "arm": arm, "checkpoints": list(checkpoints), "window": window,
+           "failure_rate": failure_rate, "alarms": list(getattr(env, "hf_alarms", [])),
+           "failed": list(getattr(env, "hf_failed", [])), "mse": errors,
            "standardized": [(e - goal.norm_mu) / goal.norm_sigma for e in errors],
            "queries": [str(q) for q in queries], "observations": [str(o) for o in observations],
            "valid_measurements": int(sum(map(bool, successes))), "calls": calls["n"],
@@ -553,7 +647,8 @@ def main(call=None, argv=None):
     ap.add_argument("--arms", default="flat,delegated")
     ap.add_argument("--checkpoints", default="0,5,10")
     ap.add_argument("--evals", type=int, default=10)
-    ap.add_argument("--window", type=int, default=None)
+    ap.add_argument("--window", type=int, default=None, help="the model sees only the last N measurements")
+    ap.add_argument("--failures", type=float, default=0.0, help="silent failure rate of the instrument")
     ap.add_argument("--jobs", type=int, default=1)
     ap.add_argument("--boxing-gym", default="boxing-gym", help="path to a boxing-gym checkout (for run_experiment.py)")
     ap.add_argument("--out", default=None)
@@ -564,7 +659,7 @@ def main(call=None, argv=None):
     done = set()
     if a.out and Path(a.out).exists():
         done = {(e["env"], e["seed"], e["arm"]) for e in map(json.loads, open(a.out)) if not e.get("invalid")}
-    jobs = [(e, s, arm, cps, a.evals, a.window) for e in a.envs.split(",")
+    jobs = [(e, s, arm, cps, a.evals, a.window, a.failures) for e in a.envs.split(",")
             for s in range(a.seed0, a.seed0 + a.seeds) for arm in a.arms.split(",") if (e, s, arm) not in done]
     sink = open(a.out, "a") if a.out else None
     with multiprocessing.get_context("fork").Pool(a.jobs) as pool:
